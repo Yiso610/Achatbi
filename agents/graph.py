@@ -1,20 +1,5 @@
-"""
-LangGraph workflow construction for Text-to-SQL system.
-
-This module builds the state graph that orchestrates the agent workflow:
-1. Intent Router → SQL Generator → Validator → Executor → Visualizer
-2. Error handling with Reflector node (retry loop)
-3. Conditional edges based on validation and execution results
-
-Production-grade features:
-- Async workflow execution for better performance
-- Cyclic error handling with retry limits
-- Conditional routing based on state
-- Clear workflow visualization
-- Type-safe state management
-"""
-
 import asyncio
+from pathlib import Path
 from typing import Literal, Optional
 from langgraph.graph import StateGraph, END
 
@@ -28,24 +13,12 @@ from agents.nodes import (
     visualizer_node,
     format_response_node
 )
-from infrastructure.config import get_config
-
-
-# Global cache for compiled graph (singleton pattern)
+# 为已经编译好的工作流图建立全局缓存，并尽量只创建一份
 _COMPILED_GRAPH: Optional[StateGraph] = None
 _GRAPH_LOCK = asyncio.Lock()
 
 
 def should_continue_after_routing(state: AgentState) -> Literal["generate_sql", "end"]:
-    """
-    Conditional edge after intent routing.
-    
-    Args:
-        state: Current agent state
-        
-    Returns:
-        Next node name or END
-    """
     is_relevant = state.get("is_relevant") if isinstance(state, dict) else state.is_relevant
     if is_relevant:
         return "generate_sql"
@@ -56,15 +29,6 @@ def should_continue_after_routing(state: AgentState) -> Literal["generate_sql", 
 def should_continue_after_validation(
     state: AgentState
 ) -> Literal["execute_query", "reflect"]:
-    """
-    Conditional edge after SQL validation.
-    
-    Args:
-        state: Current agent state
-        
-    Returns:
-        Next node name
-    """
     validation_passed = state.get("validation_passed") if isinstance(state, dict) else state.validation_passed
     if validation_passed:
         return "execute_query"
@@ -75,15 +39,6 @@ def should_continue_after_validation(
 def should_continue_after_execution(
     state: AgentState
 ) -> Literal["visualize", "reflect"]:
-    """
-    Conditional edge after query execution.
-    
-    Args:
-        state: Current agent state
-        
-    Returns:
-        Next node name
-    """
     error = state.get("error") if isinstance(state, dict) else state.error
     if error:
         return "reflect"
@@ -94,53 +49,19 @@ def should_continue_after_execution(
 def should_continue_after_reflection(
     state: AgentState
 ) -> Literal["validate_sql", "end"]:
-    """
-    Conditional edge after error reflection.
-    
-    Args:
-        state: Current agent state
-        
-    Returns:
-        Next node name or END
-    """
-    # Check if we have a final response (max retries exceeded)
     final_response = state.get("final_response") if isinstance(state, dict) else state.final_response
     if final_response:
         return "end"
     else:
-        # Retry: go back to validation
+        # 重试
         return "validate_sql"
 
 
 def build_graph() -> StateGraph:
-    """
-    Build the LangGraph workflow for Text-to-SQL.
-    
-    Graph structure:
-    
-    START
-      ↓
-    [Intent Router] → (not relevant) → END
-      ↓ (relevant)
-    [SQL Generator]
-      ↓
-    [SQL Validator] → (invalid) → [Reflector] ←┐
-      ↓ (valid)                      ↓          │
-    [Executor] → (error) ─────────────┘          │
-      ↓ (success)                                │
-    [Visualizer]                                 │
-      ↓                                          │
-    [Format Response]                            │
-      ↓                                          │
-    END ←────────────────────────────────────────┘
-    
-    Returns:
-        Compiled StateGraph
-    """
-    # Create graph
+    # 创建工作流图
     workflow = StateGraph(AgentState)
     
-    # Add nodes
+    # 添加节点
     workflow.add_node("route_intent", intent_router_node)
     workflow.add_node("generate_sql", sql_generator_node)
     workflow.add_node("validate_sql", sql_validator_node)
@@ -149,10 +70,10 @@ def build_graph() -> StateGraph:
     workflow.add_node("visualize", visualizer_node)
     workflow.add_node("format_response", format_response_node)
     
-    # Set entry point
+    # 设置入口节点
     workflow.set_entry_point("route_intent")
     
-    # Add conditional edges
+    # 添加条件边
     workflow.add_conditional_edges(
         "route_intent",
         should_continue_after_routing,
@@ -162,10 +83,10 @@ def build_graph() -> StateGraph:
         }
     )
     
-    # Linear edge from generator to validator
+    # 添加从 SQL 生成节点到 SQL 校验节点的线性边
     workflow.add_edge("generate_sql", "validate_sql")
     
-    # Conditional edge after validation
+    # 添加 SQL 校验后的条件边
     workflow.add_conditional_edges(
         "validate_sql",
         should_continue_after_validation,
@@ -175,7 +96,7 @@ def build_graph() -> StateGraph:
         }
     )
     
-    # Conditional edge after execution
+    # 添加 SQL 执行后的条件边
     workflow.add_conditional_edges(
         "execute_query",
         should_continue_after_execution,
@@ -185,7 +106,7 @@ def build_graph() -> StateGraph:
         }
     )
     
-    # Conditional edge after reflection (retry loop)
+    # 添加反思节点后的条件边
     workflow.add_conditional_edges(
         "reflect",
         should_continue_after_reflection,
@@ -195,26 +116,17 @@ def build_graph() -> StateGraph:
         }
     )
     
-    # Linear edge from visualizer to formatter
+    # 添加从可视化节点到响应格式化节点的线性边
     workflow.add_edge("visualize", "format_response")
     
-    # Format response goes to END
+    # 响应格式化完成后进入工作流结束标记
     workflow.add_edge("format_response", END)
     
-    # Compile graph
     return workflow.compile()
 
 
+# 获取已经编译好的工作流图
 async def get_compiled_graph() -> StateGraph:
-    """
-    Get or build the compiled graph (singleton pattern).
-    
-    Thread-safe caching to avoid rebuilding graph on every request.
-    This provides immediate 2-3s performance improvement.
-    
-    Returns:
-        Compiled StateGraph instance
-    """
     global _COMPILED_GRAPH
     
     if _COMPILED_GRAPH is None:
@@ -227,69 +139,47 @@ async def get_compiled_graph() -> StateGraph:
 
 
 def clear_graph_cache():
-    """
-    Clear cached graph (useful for testing or config changes).
-    
-    Call this if you need to rebuild the graph with new configuration.
-    """
     global _COMPILED_GRAPH
     _COMPILED_GRAPH = None
 
 
-def run_agent(question: str) -> AgentState:
-    """
-    Run the Text-to-SQL agent on a question (synchronous wrapper).
-    
-    Args:
-        question: User's natural language question
-        
-    Returns:
-        Final agent state with results
-    """
-    # Run async version in sync context
+def run_agent(
+    question: str,
+    database_path: str | Path,
+) -> AgentState:
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
     
-    return loop.run_until_complete(arun_agent(question))
+    return loop.run_until_complete(arun_agent(question, database_path))
 
 
-async def arun_agent(question: str) -> AgentState:
-    """
-    Run the Text-to-SQL agent on a question (async version).
-    
-    Args:
-        question: User's natural language question
-        
-    Returns:
-        Final agent state with results
-    """
-    # Get cached graph instead of rebuilding (performance optimization)
+async def arun_agent(
+    question: str,
+    database_path: str | Path,
+) -> AgentState:
+    # 获取已经缓存的工作流图
     graph = await get_compiled_graph()
     
-    # Initialize state - Pydantic handles all defaults automatically
-    initial_state = AgentState(question=question)
+    # 初始化状态
+    selected_database = Path(database_path).expanduser().resolve()
+    initial_state = AgentState(
+        question=question,
+        database_path=str(selected_database),
+    )
     
-    # Run graph asynchronously - convert to dict for LangGraph compatibility
+    # 异步运行
     final_state = await graph.ainvoke(initial_state.model_dump())
     
-    # Convert back to AgentState for type safety
     return AgentState(**final_state)
 
 
-# Export graph for visualization/debugging
+# 导出工作流图，用于可视化或调试
 def get_graph_visualization() -> str:
-    """
-    Get a text representation of the graph structure.
-    
-    Returns:
-        Graph visualization as string
-    """
     graph = build_graph()
     try:
-        # Try to get Mermaid diagram if available
         return graph.get_graph().draw_mermaid()
     except:
         return "Graph visualization not available. Install mermaid support."

@@ -1,45 +1,17 @@
-"""
-Agent state definition for LangGraph Text-to-SQL system.
-
-This module defines the state structure that flows through the graph.
-Uses Pydantic BaseModel for runtime validation and type safety.
-
-Production-grade features:
-- Runtime type validation with clear error messages
-- Automatic default values for optional fields
-- Field-level validation constraints
-- Rich field metadata and documentation
-- Self-documenting code structure
-"""
-
 from typing import List, Dict, Any, Optional, Annotated
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 
 class AgentState(BaseModel):
-    """
-    State that flows through the LangGraph agent.
-    
-    This state is passed between nodes and updated as the agent progresses
-    through the workflow. Using Pydantic BaseModel provides:
-    - Runtime validation of field types and constraints
-    - Automatic default values for optional fields
-    - Clear error messages for invalid data
-    - Rich field documentation
-    
-    Only the 'question' field is required at initialization.
-    All other fields have sensible defaults and are populated during workflow execution.
-    """
-    
-    # Configuration for Pydantic model behavior
+    # Pydantic数据模型配置
     model_config = ConfigDict(
-        # Allow extra fields for future extensibility
+        # 允许传入模型未声明的额外字段
         extra='allow',
-        # Validate on assignment to catch errors early
+        # 对象创建后重新赋值时也会进行类型校验
         validate_assignment=True,
-        # Use enum values instead of enum objects
+        # 使用枚举值而非枚举对象
         use_enum_values=True,
-        # Populate by field name (not alias)
+        # 允许使用字段名填充数据
         populate_by_name=True,
     )
     
@@ -47,9 +19,16 @@ class AgentState(BaseModel):
     question: Annotated[
         str,
         Field(
-            description="Original user question in natural language",
+            description="用户的自然语言问题输入",
             min_length=1,
-            examples=["Show me the top 5 artists", "What are the total sales by country?"]
+        )
+    ]
+
+    database_path: Annotated[
+        str,
+        Field(
+            min_length=1,
+            description="相关的数据库path",
         )
     ]
     
@@ -58,104 +37,111 @@ class AgentState(BaseModel):
         bool,
         Field(
             default=False,
-            description="Whether the question is relevant to the music store database. "
-                       "Set by the intent router node."
+            description="提问是否与当前使用active的数据库内容相关"
+                        "由intent router node设置"
         )
-    ] = False
+    ]
     
     # ==================== SQL Generation ====================
     sql_query: Annotated[
         str,
         Field(
             default="",
-            description="Generated SQL query from the LLM. "
-                       "Set by the SQL generator node."
+            description="LLM生成的SQL query"
+                       "由SQL generator node设置"
         )
-    ] = ""
+    ]
     
     reasoning: Annotated[
         str,
         Field(
             default="",
-            description="Chain-of-thought reasoning from the LLM explaining how it generated the SQL query. "
-                       "Helps with debugging and transparency."
+            description="LLM解释SQL语句生成的Chain-of-thought reasoning"
+                       "用于调试并提高过程透明度"
         )
-    ] = ""
+    ]
     
     # ==================== Validation ====================
     validation_passed: Annotated[
         bool,
         Field(
             default=False,
-            description="Whether the SQL query passed all validation checks (safety, syntax, relevancy). "
-                       "Set by the SQL validator node."
+            description="SQL query 是否通过所有validation检测(safety, syntax, relevancy)"
+                       "由SQL validator node设置"
         )
-    ] = False
+    ]
     
     validation_error: Annotated[
         str,
         Field(
             default="",
-            description="Error message from validation if it failed. "
-                       "Empty string if validation passed."
+            description="validation的失败error信息"
+                       "验证通过为空字符串"
         )
-    ] = ""
+    ]
     
     # ==================== Execution ====================
     query_result: Annotated[
         List[Dict[str, Any]],
         Field(
             default_factory=list,
-            description="Results from executing the SQL query. "
-                       "Each item is a dictionary representing a row with column names as keys."
+            description="SQL query结果列表"
+                       "每个结果都为一个dict"
         )
-    ] = []
+    ]
     
     error: Annotated[
         str,
         Field(
             default="",
-            description="Error message if query execution failed. "
-                       "Empty string if execution succeeded."
+            description="SQL query error"
+                       "成功则为空字符串"
         )
-    ] = ""
+    ]
     
     # ==================== Reflection/Retry ====================
     retry_count: Annotated[
         int,
         Field(
             default=0,
-            ge=0,  # Greater than or equal to 0
-            description="Number of retry attempts for SQL generation. "
-                       "Incremented by the reflector node on each retry."
+            ge=0,   # >= 0
+            description="重试次数"
+                       "根据reflector node尝试次数而增加"
         )
-    ] = 0
+    ]
     
     # ==================== Visualization ====================
     visualization_spec: Annotated[
         Optional[Dict[str, Any]],
         Field(
             default=None,
-            description="Specification for data visualization (chart type, columns, etc.). "
-                       "Set by the visualizer node. None if no visualization is recommended."
+            description="数据可视化配置（图表类型、数据列等）"
+                       "由可视化节点设置；如果不建议进行可视化，则为 None"
         )
-    ] = None
+    ]
+
+    analysis_summary: Annotated[
+        str,
+        Field(
+            default="",
+            description="基于生成的 SQL 和实际查询结果得出的简洁中文结论。"
+        )
+    ]
     
     # ==================== Final Output ====================
     final_response: Annotated[
         str,
         Field(
             default="",
-            description="Final formatted response to the user. "
-                       "Set by the format response node or error handling nodes."
+            description="给用户的最终格式化的回答"
+                       "由format response node或error handling nodes设置"
         )
-    ] = ""
+    ]
     
     # ==================== Validators ====================
     @field_validator('retry_count')
     @classmethod
     def validate_retry_count(cls, v: int) -> int:
-        """Ensure retry count is non-negative."""
         if v < 0:
             raise ValueError("retry_count must be non-negative")
         return v
@@ -163,25 +149,24 @@ class AgentState(BaseModel):
     @field_validator('query_result')
     @classmethod
     def validate_query_result(cls, v: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Ensure query_result is a list."""
         if not isinstance(v, list):
             raise ValueError("query_result must be a list")
         return v
     
     # ==================== Helper Methods ====================
     def has_error(self) -> bool:
-        """Check if the state contains any error."""
+        """检查当前状态是否包含错误"""
         return bool(self.error or self.validation_error)
     
     def is_complete(self) -> bool:
-        """Check if the workflow is complete (has final response)."""
+        """检查工作流是否已完成（是否已经生成最终回答）"""
         return bool(self.final_response)
     
     def get_error_message(self) -> str:
-        """Get the current error message (validation or execution)."""
+        """获取当前错误信息（验证错误或执行错误）"""
         return self.validation_error or self.error
     
     def reset_errors(self) -> None:
-        """Clear all error fields (used before retry)."""
+        """清空所有错误字段（通常在重试前调用）"""
         self.error = ""
         self.validation_error = ""
