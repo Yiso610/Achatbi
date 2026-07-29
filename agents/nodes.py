@@ -73,11 +73,10 @@ async def sql_generator_node(state: AgentState) -> Dict[str, Any]:
     question = state.question if isinstance(state, AgentState) else state["question"]
     db_manager = get_database_manager(state)
     
-    # 获取schema及少量行作为示例数据
+    # 获取带业务说明的数据库 Schema
     schema = db_manager.get_annotated_schema()
-    sample_data = db_manager.get_sample_data()
     
-    prompt = get_sql_generator_prompt(question, schema, sample_data)
+    prompt = get_sql_generator_prompt(question, schema)
     llm = get_sql_generator_llm()
     
     try:
@@ -357,12 +356,27 @@ async def visualizer_node(state: AgentState) -> Dict[str, Any]:
             json_str = response_text
             
         viz_spec = json.loads(json_str)
+        if not isinstance(viz_spec, dict):
+            raise ValueError("可视化模型未返回 JSON 对象")
         analysis_summary = str(viz_spec.pop("summary", "") or "").strip()
+
+        if str(viz_spec.get("chart_type", "")).lower() == "none":
+            viz_spec = {
+                "chart_type": "none",
+                "x_column": None,
+                "y_column": None,
+                "z_column": None,
+                "title": str(viz_spec.get("title", "查询结果") or "查询结果"),
+            }
         
         return {
             "visualization_spec": viz_spec,
             "analysis_summary": analysis_summary,
-            "final_response": "查询和图表生成成功。"
+            "final_response": (
+                "查询成功，未生成图表。"
+                if viz_spec["chart_type"] == "none"
+                else "查询和图表生成成功。"
+            )
         }
         
     except Exception as e:
