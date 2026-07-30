@@ -1,82 +1,48 @@
-"""
-Configuration management for Text-to-SQL system.
-
-This module handles:
-- Environment variable loading
-- Model configuration
-- Application settings
-- Validation of required configurations
-
-Production-grade features:
-- Type-safe configuration using Pydantic
-- Comprehensive validation
-- Clear error messages for missing configuration
-"""
-
 import os
-from typing import Optional
-from pathlib import Path
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
 
-# Load environment variables from .env file
+# 将env变量加载到环境变量中
 load_dotenv()
 
 
 class Config(BaseModel):
-    """
-    Application configuration with validation.
-    
-    All configuration values are loaded from environment variables
-    with sensible defaults where appropriate.
-    """
-    
-    # API Configuration
-    google_api_key: str = Field(
-        default_factory=lambda: os.getenv("GOOGLE_API_KEY", ""),
-        description="Google Gemini API key"
+    dashscope_api_key: str = Field(
+        default_factory=lambda: os.getenv("DASHSCOPE_API_KEY", ""),
+        description="Alibaba Cloud Model Studio API key",
     )
-    
-    # Model Configuration
+
+    dashscope_base_url: str = Field(
+        default_factory=lambda: os.getenv(
+            "DASHSCOPE_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        description="OpenAI-compatible endpoint for Qwen",
+    )
+
+    # 模型配置
     router_model: str = Field(
-        default_factory=lambda: os.getenv("ROUTER_MODEL", "gemini-2.0-flash-exp"),
-        description="Model for intent routing and fast operations"
+        default_factory=lambda: os.getenv("ROUTER_MODEL", "qwen-plus"),
+        description="Qwen model for intent routing and fast operations",
     )
-    
+
     sql_generator_model: str = Field(
-        default_factory=lambda: os.getenv("SQL_GENERATOR_MODEL", "gemini-1.5-pro"),
-        description="Model for SQL generation (requires strong reasoning)"
+        default_factory=lambda: os.getenv("SQL_GENERATOR_MODEL", "qwen-plus"),
+        description="Qwen model for SQL generation",
     )
-    
+
     reflector_model: str = Field(
-        default_factory=lambda: os.getenv("REFLECTOR_MODEL", "gemini-2.0-flash-exp"),
-        description="Model for error correction and reflection"
+        default_factory=lambda: os.getenv("REFLECTOR_MODEL", "qwen-plus"),
+        description="Qwen model for error correction and reflection",
+    )
+
+    visualizer_model: str = Field(
+        default_factory=lambda: os.getenv("VISUALIZER_MODEL", "qwen-plus"),
+        description="Qwen model for chart recommendations",
     )
     
-    use_open_source: bool = Field(
-        default_factory=lambda: os.getenv("USE_OPEN_SOURCE", "False").lower() == "true",
-        description="Whether to use open-source models instead of Gemini"
-    )
-    
-    # Hugging Face Configuration
-    huggingface_api_token: str = Field(
-        default_factory=lambda: os.getenv("HUGGINGFACE_API_TOKEN", ""),
-        description="Hugging Face API token for open-source models"
-    )
-    
-    huggingface_model_repo: str = Field(
-        default_factory=lambda: os.getenv("HUGGINGFACE_MODEL_REPO", "defog/sqlcoder-7b-2"),
-        description="Hugging Face model repository ID"
-    )
-    
-    # Database Configuration
-    database_path: Path = Field(
-        default_factory=lambda: Path(os.getenv("DATABASE_PATH", "chinook.db")),
-        description="Path to SQLite database file"
-    )
-    
-    # Application Settings
+    # 应用设置
     max_retry_count: int = Field(
         default_factory=lambda: int(os.getenv("MAX_RETRY_COUNT", "3")),
         description="Maximum number of retry attempts for SQL generation",
@@ -90,79 +56,101 @@ class Config(BaseModel):
         ge=1,
         le=1000
     )
-    
-    # LLM Settings
-    temperature: float = Field(
-        default=0.0,
-        description="Temperature for LLM generation (0 for deterministic)",
-        ge=0.0,
-        le=1.0
+
+    max_result_bytes: int = Field(
+        default_factory=lambda: int(
+            os.getenv("MAX_RESULT_BYTES", str(5 * 1024 * 1024))
+        ),
+        description="Maximum approximate in-memory query result size",
+        ge=1024,
+        le=100 * 1024 * 1024,
+    )
+
+    sql_query_timeout_seconds: int = Field(
+        default_factory=lambda: int(
+            os.getenv("SQL_QUERY_TIMEOUT_SECONDS", "15")
+        ),
+        description="Maximum SQLite execution time for one generated query",
+        ge=1,
+        le=120,
+    )
+
+    max_sql_query_bytes: int = Field(
+        default_factory=lambda: int(
+            os.getenv("MAX_SQL_QUERY_BYTES", "100000")
+        ),
+        description="Maximum generated SQLite SQL text size",
+        ge=1000,
+        le=1_000_000,
+    )
+
+    max_result_columns: int = Field(
+        default_factory=lambda: int(
+            os.getenv("MAX_RESULT_COLUMNS", "200")
+        ),
+        description="Maximum number of columns in a SQLite result",
+        ge=1,
+        le=1000,
     )
     
-    @field_validator("google_api_key")
+    # LLM 设置
+    temperature: float = Field(
+        default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.0")),
+        description="Temperature for LLM generation (0 for deterministic)",
+        ge=0.0,
+        le=1.0,
+    )
+
+    llm_timeout: int = Field(
+        default_factory=lambda: int(os.getenv("LLM_TIMEOUT", "60")),
+        description="Timeout for each Qwen request in seconds",
+        ge=1,
+        le=300,
+    )
+
+    llm_max_retries: int = Field(
+        default_factory=lambda: int(os.getenv("LLM_MAX_RETRIES", "2")),
+        description="Maximum retries for transient Qwen API failures",
+        ge=0,
+        le=5,
+    )
+
+    @field_validator("dashscope_api_key")
     @classmethod
     def validate_api_key(cls, v: str) -> str:
-        """Validate that API key is provided when not using open-source models."""
-        if not v or v == "your_api_key_here":
-            # Check if we're using open-source models
-            use_open_source = os.getenv("USE_OPEN_SOURCE", "False").lower() == "true"
-            if not use_open_source:
-                raise ValueError(
-                    "GOOGLE_API_KEY is required. Please set it in your .env file. "
-                    "Get your API key from: https://makersuite.google.com/app/apikey"
-                )
-        return v
-    
-    @field_validator("huggingface_api_token")
-    @classmethod
-    def validate_hf_token(cls, v: str, info) -> str:
-        """Validate that HF token is provided when using open-source models."""
-        use_open_source = os.getenv("USE_OPEN_SOURCE", "False").lower() == "true"
-        
-        if use_open_source and (not v or v == "your_hf_token_here"):
+        placeholders = {
+            "",
+            "your_api_key_here",
+            "your_dashscope_api_key_here",
+            "sk-your-dashscope-api-key",
+        }
+        if v.strip().strip('"').strip("'") in placeholders:
             raise ValueError(
-                "HUGGINGFACE_API_TOKEN is required when USE_OPEN_SOURCE is True. "
-                "Please set it in your .env file. "
-                "Get your token from: https://huggingface.co/settings/tokens"
+                "DASHSCOPE_API_KEY is required."
             )
         return v
-    
-    @field_validator("database_path")
+
+    @field_validator("dashscope_base_url")
     @classmethod
-    def validate_database_path(cls, v: Path) -> Path:
-        """Validate that database file exists."""
-        if not v.exists():
-            raise ValueError(
-                f"Database file not found: {v}. "
-                f"Please ensure chinook.db is in the correct location."
-            )
-        return v
-    
+    def validate_base_url(cls, v: str) -> str:
+        value = v.strip().rstrip("/")
+        if not value.startswith(("https://", "http://")):
+            raise ValueError("DASHSCOPE_BASE_URL must be an HTTP(S) URL.")
+        return value
+
     class Config:
-        """Pydantic configuration."""
-        frozen = True  # Make configuration immutable
+        frozen = True  # 配置对象创建后不能修改
         validate_assignment = True
 
-
-# Global configuration instance
-# This is initialized once and reused throughout the application
 try:
     config = Config()
 except Exception as e:
-    # Provide helpful error message if configuration fails
     print(f"[ERROR] Configuration Error: {e}")
     print("\n[INFO] Quick Fix:")
     print("1. Copy .env.example to .env")
-    print("2. Add your GOOGLE_API_KEY to the .env file")
-    print("3. Ensure chinook.db is in the project directory")
+    print("2. Add your DASHSCOPE_API_KEY to the .env file")
     raise
 
 
 def get_config() -> Config:
-    """
-    Get the global configuration instance.
-    
-    Returns:
-        Config: Validated configuration object
-    """
     return config
