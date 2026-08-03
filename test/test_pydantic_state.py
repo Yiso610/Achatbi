@@ -13,20 +13,26 @@ import sys
 from pathlib import Path
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agents.state import AgentState
 
 
+TEST_DATABASE_PATH = "data/uploads/test-source.db"
+
+
 def test_state_initialization():
-    """Test that state can be initialized with only required fields."""
+    """Test that state can be initialized with all required fields."""
     print("[TEST] State Initialization...")
     try:
-        # Should work with only question field
-        state = AgentState(question="What are the top 5 artists?")
+        state = AgentState(
+            question="What are the top 5 artists?",
+            database_path=TEST_DATABASE_PATH,
+        )
         
         # Verify required field
         assert state.question == "What are the top 5 artists?"
+        assert state.database_path == TEST_DATABASE_PATH
         
         # Verify default values
         assert state.is_relevant == False
@@ -52,7 +58,18 @@ def test_field_validation():
     print("\n[TEST] Field Validation...")
     try:
         # Test retry_count validation (must be >= 0)
-        state = AgentState(question="Test question")
+        state = AgentState(
+            question="Test question",
+            database_path=TEST_DATABASE_PATH,
+        )
+
+        # A request without a selected database must be rejected.
+        try:
+            AgentState(question="Test question")
+            print("   [FAIL] Missing database_path should raise error")
+            return False
+        except ValueError:
+            print("   [PASS] Missing database_path rejected")
         
         # Valid retry count
         state.retry_count = 5
@@ -82,7 +99,10 @@ def test_helper_methods():
     """Test helper methods."""
     print("\n[TEST] Helper Methods...")
     try:
-        state = AgentState(question="Test question")
+        state = AgentState(
+            question="Test question",
+            database_path=TEST_DATABASE_PATH,
+        )
         
         # Test has_error()
         assert state.has_error() == False
@@ -91,14 +111,20 @@ def test_helper_methods():
         print("   [PASS] has_error() works correctly")
         
         # Test is_complete()
-        state2 = AgentState(question="Test")
+        state2 = AgentState(
+            question="Test",
+            database_path=TEST_DATABASE_PATH,
+        )
         assert state2.is_complete() == False
         state2.final_response = "Here is your answer"
         assert state2.is_complete() == True
         print("   [PASS] is_complete() works correctly")
         
         # Test get_error_message()
-        state3 = AgentState(question="Test")
+        state3 = AgentState(
+            question="Test",
+            database_path=TEST_DATABASE_PATH,
+        )
         state3.validation_error = "Validation failed"
         assert state3.get_error_message() == "Validation failed"
         state3.error = "Execution failed"
@@ -123,7 +149,10 @@ def test_model_dump():
     """Test conversion to dict for LangGraph compatibility."""
     print("\n[TEST] Model Dump (Dict Conversion)...")
     try:
-        state = AgentState(question="Test question")
+        state = AgentState(
+            question="Test question",
+            database_path=TEST_DATABASE_PATH,
+        )
         state_dict = state.model_dump()
         
         # Verify it's a dict
@@ -131,6 +160,7 @@ def test_model_dump():
         
         # Verify all fields are present
         assert "question" in state_dict
+        assert "database_path" in state_dict
         assert "is_relevant" in state_dict
         assert "sql_query" in state_dict
         assert "retry_count" in state_dict
@@ -158,7 +188,10 @@ def test_field_updates():
     """Test updating state fields."""
     print("\n[TEST] Field Updates...")
     try:
-        state = AgentState(question="Test question")
+        state = AgentState(
+            question="Test question",
+            database_path=TEST_DATABASE_PATH,
+        )
         
         # Update various fields
         state.is_relevant = True

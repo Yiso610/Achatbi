@@ -9,6 +9,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -39,3 +40,9 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# User-uploaded databases
+data/uploads/*
+
+# Local account, permission, session-version, and audit metadata
+data/system/*

@@ -16,15 +16,30 @@ import plotly.express as px
 from pathlib import Path
 from typing import Dict, Any, List
 
-from agents.graph import run_agent
+from application.query_service import AuthorizedQueryService
+from dashboard_ui import render_dashboard_page, save_result_and_place
+from auth.constants import (
+    DELETE_DATASOURCE,
+    IMPORT_DATASOURCE,
+    MANAGE_DATASOURCE_ACCESS,
+    QUERY_DATA,
+)
+from auth.models import AuthError, DataSourceRecord, User
+from auth.service import AuthService, get_auth_service
+from auth.ui import (
+    render_account_sidebar,
+    render_audit_logs,
+    render_auth_gate,
+    render_user_management,
+)
 from infrastructure.data_sources import (
     DataSourceError,
     database_display_name,
-    delete_database_source,
     inspect_sqlite_database,
     list_database_sources,
     list_remote_databases,
-    snapshot_remote_database,
+    stage_excel_workbook,
+    stage_remote_database,
 )
 from infrastructure.db_manager import DatabaseManager
 from infrastructure.validators import InputValidator, QueryResultValidator
@@ -36,7 +51,7 @@ input_validator = InputValidator()
 result_validator = QueryResultValidator()
 
 # Setup LangSmith tracing for observability
-setup_langsmith(project_name="text2sql-production", enabled=True)
+setup_langsmith(project_name="智能数据查询平台", enabled=True)
 
 
 
@@ -137,8 +152,42 @@ st.markdown("""
         margin: -0.65rem 0 0.9rem;
     }
 
+    /* Primary two-page workspace navigation */
+    div[class*="st-key-workspace_page"] {
+        display: flex;
+        justify-content: center;
+        margin: -0.35rem 0 1.1rem;
+    }
+
+    div[class*="st-key-workspace_page"] div[role="radiogroup"] {
+        display: inline-flex;
+        width: auto;
+        padding: 4px;
+        gap: 4px;
+        border: 1px solid #dde3ec;
+        border-radius: 0.8rem;
+        background: #f5f7fa;
+    }
+
+    div[class*="st-key-workspace_page"] label {
+        min-width: 132px;
+        padding: 0.5rem 1.15rem;
+        justify-content: center;
+        border-radius: 0.6rem;
+        cursor: pointer;
+    }
+
+    div[class*="st-key-workspace_page"] label:has(input:checked) {
+        background: #ffffff;
+        box-shadow: 0 2px 7px rgba(15, 23, 42, 0.09);
+    }
+
+    div[class*="st-key-workspace_page"] label > div:first-child {
+        display: none;
+    }
+
     /* GPT-style question composer */
-    div[data-testid="stForm"] {
+    div[class*="st-key-question_composer"] div[data-testid="stForm"] {
         background: #ffffff;
         border: 1px solid #d9dce3;
         border-radius: 1.15rem;
@@ -147,12 +196,14 @@ st.markdown("""
         transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"]:focus-within {
         border-color: #aeb4bf;
         box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.06),
                     0 4px 16px rgba(15, 23, 42, 0.07);
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"] div[data-testid="stTextInput"]
     [data-baseweb="base-input"] {
         min-height: 52px;
@@ -162,6 +213,7 @@ st.markdown("""
         box-shadow: none !important;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"] div[data-testid="stTextInputRootElement"] {
         min-height: 52px !important;
         height: 52px !important;
@@ -172,12 +224,14 @@ st.markdown("""
         align-items: center !important;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"] div[data-testid="stTextInput"]
     [data-baseweb="base-input"]:focus-within {
         border: 0 !important;
         box-shadow: none !important;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"] div[data-testid="stTextInput"] input {
         min-height: 52px !important;
         height: 52px !important;
@@ -187,19 +241,30 @@ st.markdown("""
         background: transparent !important;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"] div[data-testid="InputInstructions"] {
         display: none !important;
     }
 
+    /* Hide Streamlit's default "Press Enter to submit" helper text. */
+    div[data-testid="InputInstructions"] {
+        display: none !important;
+    }
+
+    div[class*="st-key-question_composer"]
     div[data-testid="stFormSubmitButton"] {
         display: flex;
         align-items: center;
         justify-content: flex-end;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stFormSubmitButton"] button,
+    div[class*="st-key-question_composer"]
     div[data-testid="stFormSubmitButton"] button:hover,
+    div[class*="st-key-question_composer"]
     div[data-testid="stFormSubmitButton"] button:focus,
+    div[class*="st-key-question_composer"]
     div[data-testid="stFormSubmitButton"] button:active {
         width: 42px !important;
         min-width: 42px !important;
@@ -214,6 +279,7 @@ st.markdown("""
         transform: none !important;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stFormSubmitButton"] button p {
         color: #ffffff !important;
         font-size: 1.3rem !important;
@@ -221,11 +287,13 @@ st.markdown("""
         line-height: 1;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"]:has(input:placeholder-shown)
     div[data-testid="stFormSubmitButton"] button {
         background: #d1d5db !important;
     }
 
+    div[class*="st-key-question_composer"]
     div[data-testid="stForm"]:has(input:placeholder-shown)
     div[data-testid="stFormSubmitButton"] button p {
         color: #ffffff !important;
@@ -453,8 +521,8 @@ st.markdown("""
 
 
 # 渲染页面顶部区域
-def render_header():
-    st.title("智能数据分析平台")
+def render_header(title: str = "智能数据分析平台"):
+    st.title(title)
 
 
 # 分情况处理服务器地址
@@ -482,13 +550,40 @@ def _parse_server_address(
     return value, default_port
 
 
+def _clear_query_state(*, clear_draft: bool = True) -> None:
+    """Clear results and drafts that belong to a previous data context."""
+    if clear_draft:
+        st.session_state.pop("question_draft", None)
+    for key in (
+        "queued_question",
+        "results",
+        "results_owner_user_id",
+        "results_datasource_id",
+        "results_datasource_version",
+    ):
+        st.session_state.pop(key, None)
+
+
 # 删除数据库弹窗和确认流程
 @st.dialog("确认删除数据库")
 def _confirm_database_deletion(
-    database_path: str,
+    datasource_id: int,
+    user_id: int,
+    session_version: int,
 ) -> None:
-    path = Path(database_path)
-    database_name = database_display_name(path)
+    service = get_auth_service()
+    try:
+        service.validate_session(user_id, session_version)
+        datasource = service.resolve_authorized_datasource(
+            user_id,
+            datasource_id,
+            DELETE_DATASOURCE,
+        )
+    except AuthError as error:
+        st.error(str(error))
+        return
+
+    database_name = datasource.display_name
     st.write(f"是否确认删除数据库“{database_name}”？")
     st.caption("删除后，本机保存的分析副本将被移除，此操作无法撤销。")
 
@@ -508,32 +603,305 @@ def _confirm_database_deletion(
             use_container_width=True,
         ):
             try:
-                delete_database_source(path)
-            except DataSourceError as error:
+                # Authorization, file quarantine, registry update, and audit
+                # are committed as one rollback-capable service operation.
+                service.delete_datasource(
+                    user_id,
+                    session_version,
+                    datasource_id,
+                )
+            except AuthError as error:
                 st.error(str(error))
                 return
 
-            if st.session_state.get("active_database_path") == database_path:
-                st.session_state.pop("active_database_path", None)
-                st.session_state.question_draft = ""
-                st.session_state.results = None
+            if st.session_state.get("active_datasource_id") == datasource_id:
+                st.session_state.pop("active_datasource_id", None)
+                _clear_query_state()
             st.session_state.database_notice = (
                 f"数据库“{database_name}”已删除"
             )
             st.rerun()
 
-# 渲染侧边栏界面，处理侧边栏中的数据库用户操作
-def render_sidebar() -> Path | None:
-    sources = list_database_sources()
-    source_values = [str(path) for path in sources]
 
-    active_value = st.session_state.get(
-        "active_database_path",
-        source_values[0] if source_values else "",
+def _render_remote_database_import(
+    current_user: User,
+    service: AuthService,
+) -> None:
+    st.markdown("**添加数据库连接**")
+    database_type = st.selectbox(
+        "数据库类型",
+        options=("MySQL", "PostgreSQL"),
+        key="remote_database_type",
     )
-    if active_value not in source_values:
-        active_value = source_values[0] if source_values else ""
-        st.session_state.active_database_path = active_value
+    provider_key = database_type.lower()
+    default_port = 3306 if database_type == "MySQL" else 5432
+
+    remote_server = st.text_input(
+        "服务器地址",
+        placeholder=f"例如：127.0.0.1:{default_port}",
+        key=f"{provider_key}_server",
+    )
+    remote_user = st.text_input(
+        "用户名",
+        key=f"{provider_key}_user",
+    )
+    remote_password = st.text_input(
+        "密码",
+        type="password",
+        key=f"{provider_key}_password",
+    )
+    st.caption(
+        f"端口可省略，默认使用 {default_port}；"
+        "密码只保留在当前登录会话中。"
+    )
+
+    remote_host, remote_port_number = _parse_server_address(
+        remote_server,
+        default_port,
+    )
+    connection_key = "|".join(
+        (
+            database_type,
+            remote_host.strip(),
+            str(remote_port_number),
+            remote_user.strip(),
+        )
+    )
+    can_connect = bool(
+        remote_host
+        and remote_user.strip()
+        and 1 <= remote_port_number <= 65535
+    )
+    discover_databases = st.button(
+        "连接并读取数据库",
+        key=f"discover_{provider_key}_databases",
+        disabled=not can_connect,
+        use_container_width=True,
+    )
+
+    if discover_databases:
+        try:
+            service.validate_session(
+                current_user.id,
+                current_user.session_version,
+            )
+            service.require_permission(
+                current_user.id,
+                IMPORT_DATASOURCE,
+            )
+            with st.spinner("正在连接数据库…"):
+                remote_databases = list_remote_databases(
+                    database_type,
+                    remote_host,
+                    remote_port_number,
+                    remote_user,
+                    remote_password,
+                )
+            service.validate_session(
+                current_user.id,
+                current_user.session_version,
+            )
+            service.require_permission(
+                current_user.id,
+                IMPORT_DATASOURCE,
+            )
+            st.session_state.remote_database_catalog = {
+                "connection_key": connection_key,
+                "databases": remote_databases,
+            }
+            st.success(
+                "连接成功，发现 "
+                f"{len(remote_databases)} 个数据库。"
+            )
+        except (AuthError, DataSourceError) as error:
+            st.session_state.pop("remote_database_catalog", None)
+            st.error(str(error))
+
+    remote_catalog = st.session_state.get("remote_database_catalog")
+    if (
+        remote_catalog
+        and remote_catalog.get("connection_key") == connection_key
+    ):
+        selected_remote_database = st.selectbox(
+            "选择数据库",
+            options=remote_catalog["databases"],
+            key=f"{provider_key}_database_name",
+        )
+        st.caption(
+            "平台会为该数据库创建本机只读分析副本（最大 100 MB）。"
+        )
+        add_database = st.button(
+            "添加数据库",
+            key=f"add_{provider_key}_database",
+            use_container_width=True,
+        )
+        if add_database:
+            staged_snapshot = None
+            try:
+                service.validate_session(
+                    current_user.id,
+                    current_user.session_version,
+                )
+                with st.spinner("正在同步数据库结构和数据…"):
+                    staged_snapshot = stage_remote_database(
+                        database_type,
+                        remote_host,
+                        remote_port_number,
+                        remote_user,
+                        remote_password,
+                        selected_remote_database,
+                    )
+                registered = service.publish_staged_datasource(
+                    current_user.id,
+                    current_user.session_version,
+                    staged_path=staged_snapshot.staged_path,
+                    target_path=staged_snapshot.target_path,
+                    display_name=selected_remote_database,
+                )
+                st.session_state.active_datasource_id = registered.id
+                _clear_query_state()
+                st.session_state.pop("remote_database_catalog", None)
+                st.session_state.pop(f"{provider_key}_password", None)
+                st.session_state.database_notice = "数据库已添加"
+                st.rerun()
+            except (AuthError, DataSourceError) as error:
+                service.record_audit(
+                    actor_user_id=current_user.id,
+                    action="import_datasource",
+                    outcome="failure",
+                    target_type="remote_database",
+                    target_id=selected_remote_database,
+                    details={"error_type": error.__class__.__name__},
+                )
+                st.error(str(error))
+            finally:
+                if staged_snapshot is not None:
+                    staged_snapshot.staged_path.unlink(missing_ok=True)
+
+def _render_excel_import(
+    current_user: User,
+    service: AuthService,
+) -> None:
+    st.markdown("**添加 Excel 文件**")
+    st.caption(
+        "每个工作表会转换为一张数据表，平台将自动识别字段名和数据类型，"
+        "并创建独立的本地分析数据库。"
+    )
+    uploaded_file = st.file_uploader(
+        "选择 Excel 文件",
+        type=("xlsx", "xlsm"),
+        accept_multiple_files=False,
+        key="excel_datasource_file",
+        help="支持 .xlsx 和 .xlsm，文件最大 20 MB。",
+    )
+    if uploaded_file is None:
+        return
+
+    file_size = int(getattr(uploaded_file, "size", 0))
+    if file_size:
+        st.caption(f"已选择：{uploaded_file.name} · {file_size / 1024:.1f} KB")
+    import_excel = st.button(
+        "导入并使用",
+        key="import_excel_datasource",
+        type="primary",
+        use_container_width=True,
+    )
+    if not import_excel:
+        return
+
+    staged_snapshot = None
+    try:
+        service.validate_session(
+            current_user.id,
+            current_user.session_version,
+        )
+        service.require_permission(current_user.id, IMPORT_DATASOURCE)
+        with st.spinner("正在识别工作表、生成 Schema 并导入数据…"):
+            staged_snapshot = stage_excel_workbook(
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+            )
+        registered = service.publish_staged_datasource(
+            current_user.id,
+            current_user.session_version,
+            staged_path=staged_snapshot.staged_path,
+            target_path=staged_snapshot.target_path,
+            display_name=staged_snapshot.display_name,
+        )
+        st.session_state.active_datasource_id = registered.id
+        _clear_query_state()
+        st.session_state.database_notice = (
+            f"Excel 数据“{registered.display_name}”已导入"
+        )
+        st.rerun()
+    except (AuthError, DataSourceError) as error:
+        service.record_audit(
+            actor_user_id=current_user.id,
+            action="import_datasource",
+            outcome="failure",
+            target_type="excel_file",
+            target_id=Path(uploaded_file.name).name,
+            details={"error_type": error.__class__.__name__},
+        )
+        st.error(str(error))
+    finally:
+        if staged_snapshot is not None:
+            staged_snapshot.staged_path.unlink(missing_ok=True)
+
+
+@st.dialog("添加数据", width="large")
+def _render_add_data_dialog(
+    user_id: int,
+    session_version: int,
+) -> None:
+    service = get_auth_service()
+    try:
+        current_user = service.validate_session(user_id, session_version)
+        service.require_permission(current_user.id, IMPORT_DATASOURCE)
+    except AuthError as error:
+        st.error(str(error))
+        return
+
+    source_type = st.selectbox(
+        "选择添加方式",
+        options=("数据库", "Excel 文件"),
+        key="add_data_source_type",
+    )
+    st.divider()
+    if source_type == "数据库":
+        _render_remote_database_import(current_user, service)
+    else:
+        _render_excel_import(current_user, service)
+
+# 渲染侧边栏界面，处理侧边栏中的数据库用户操作
+def render_sidebar(
+    current_user: User,
+    service: AuthService,
+) -> DataSourceRecord | None:
+    sources = service.list_visible_datasources(current_user.id)
+    source_by_id = {source.id: source for source in sources}
+    source_ids = list(source_by_id)
+
+    active_id = st.session_state.get(
+        "active_datasource_id",
+        source_ids[0] if source_ids else None,
+    )
+    if active_id not in source_by_id:
+        active_id = source_ids[0] if source_ids else None
+        if active_id is None:
+            st.session_state.pop("active_datasource_id", None)
+        else:
+            st.session_state.active_datasource_id = active_id
+        _clear_query_state()
+
+    can_import = service.has_permission(
+        current_user.id,
+        IMPORT_DATASOURCE,
+    )
+    can_delete = service.has_permission(
+        current_user.id,
+        DELETE_DATASOURCE,
+    )
 
     with st.sidebar:
         st.header("数据目录")
@@ -542,149 +910,46 @@ def render_sidebar() -> Path | None:
         if notice:
             st.toast(notice, icon="✅")
 
-        database_label_column, add_column = st.columns(
-            [0.84, 0.16],
-            gap="small",
-            vertical_alignment="center",
-        )
-
-        with database_label_column:
-            st.markdown(
-                '<div class="database-list-label">数据库列表</div>',
-                unsafe_allow_html=True,
-            )
-
-        with add_column:
-            with st.popover(
-                "＋",
-                help="添加数据库",
-                use_container_width=False,
-            ):
-                st.markdown("**添加数据库连接**")
-                database_type = st.selectbox(
-                    "数据库类型",
-                    options=("MySQL", "PostgreSQL"),
-                    key="remote_database_type",
-                )
-                provider_key = database_type.lower()
-                default_port = 3306 if database_type == "MySQL" else 5432
-
-                remote_server = st.text_input(
-                    "服务器地址",
-                    placeholder=f"例如：127.0.0.1:{default_port}",
-                    key=f"{provider_key}_server",
-                )
-                remote_user = st.text_input(
-                    "用户名",
-                    key=f"{provider_key}_user",
-                )
-                remote_password = st.text_input(
-                    "密码",
-                    type="password",
-                    key=f"{provider_key}_password",
-                )
-                st.caption(
-                    f"端口可省略，默认使用 {default_port}；"
-                    "密码不会写入项目文件。"
-                )
-
-                remote_host, remote_port_number = _parse_server_address(
-                    remote_server,
-                    default_port,
-                )
-
-                connection_key = "|".join(
-                    (
-                        database_type,
-                        remote_host.strip(),
-                        str(remote_port_number),
-                        remote_user.strip(),
-                    )
-                )
-                can_connect = bool(
-                    remote_host
-                    and remote_user.strip()
-                    and 1 <= remote_port_number <= 65535
-                )
-                discover_databases = st.button(
-                    "连接并读取数据库",
-                    key=f"discover_{provider_key}_databases",
-                    disabled=not can_connect,
-                    use_container_width=True,
-                )
-
-                if discover_databases:
-                    try:
-                        with st.spinner("正在连接数据库…"):
-                            remote_databases = list_remote_databases(
-                                database_type,
-                                remote_host,
-                                remote_port_number,
-                                remote_user,
-                                remote_password,
-                            )
-                        st.session_state.remote_database_catalog = {
-                            "connection_key": connection_key,
-                            "databases": remote_databases,
-                        }
-                        st.success(
-                            f"连接成功，发现 {len(remote_databases)} 个数据库。"
-                        )
-                    except DataSourceError as error:
-                        st.session_state.pop(
-                            "remote_database_catalog",
-                            None,
-                        )
-                        st.error(str(error))
-
-                remote_catalog = st.session_state.get(
-                    "remote_database_catalog",
-                )
-                if (
-                    remote_catalog
-                    and remote_catalog.get("connection_key")
-                    == connection_key
-                ):
-                    selected_remote_database = st.selectbox(
-                        "选择数据库",
-                        options=remote_catalog["databases"],
-                        key=f"{provider_key}_database_name",
-                    )
-                    st.caption("添加后会生成本机只读分析副本，最大 100 MB。")
-                    add_database = st.button(
-                        "添加并使用",
-                        key=f"add_{provider_key}_database",
-                        use_container_width=True,
-                    )
-                    if add_database:
-                        try:
-                            with st.spinner("正在同步数据库结构和数据…"):
-                                saved_path = snapshot_remote_database(
-                                    database_type,
-                                    remote_host,
-                                    remote_port_number,
-                                    remote_user,
-                                    remote_password,
-                                    selected_remote_database,
-                                )
-                            st.session_state.active_database_path = str(
-                                saved_path
-                            )
-                            st.session_state.question_draft = ""
-                            st.session_state.results = None
-                            st.success("数据库已添加")
-                            st.rerun()
-                        except DataSourceError as error:
-                            st.error(str(error))
-
-        for source_index, source in enumerate(sources):
-            source_value = str(source)
-            is_active = source_value == active_value
-            database_column, delete_column = st.columns(
+        if can_import:
+            database_label_column, add_column = st.columns(
                 [0.84, 0.16],
                 gap="small",
                 vertical_alignment="center",
             )
+            with database_label_column:
+                st.markdown(
+                    '<div class="database-list-label">数据源列表</div>',
+                    unsafe_allow_html=True,
+                )
+            with add_column:
+                if st.button(
+                    "＋",
+                    key=f"open_add_data_{current_user.id}",
+                    help="添加数据",
+                    use_container_width=False,
+                ):
+                    _render_add_data_dialog(
+                        current_user.id,
+                        current_user.session_version,
+                    )
+        else:
+            st.markdown(
+                '<div class="database-list-label">数据源列表</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("当前账号只能查询已授权的数据源。")
+
+        for source_index, source in enumerate(sources):
+            is_active = source.id == active_id
+            if can_delete:
+                database_column, delete_column = st.columns(
+                    [0.84, 0.16],
+                    gap="small",
+                    vertical_alignment="center",
+                )
+            else:
+                database_column = st.container()
+                delete_column = None
 
             with database_column:
                 button_prefix = (
@@ -693,33 +958,53 @@ def render_sidebar() -> Path | None:
                     else "database_source"
                 )
                 selected = st.button(
-                    database_display_name(source),
-                    key=f"{button_prefix}_{source_index}",
-                    help=f"切换到数据库：{database_display_name(source)}",
+                    source.display_name,
+                    key=(
+                        f"{button_prefix}_{current_user.id}_{source.id}"
+                    ),
+                    help=f"切换到数据源：{source.display_name}",
                     use_container_width=True,
                 )
                 if selected and not is_active:
-                    st.session_state.active_database_path = source_value
-                    st.session_state.question_draft = ""
-                    st.session_state.results = None
-                    active_value = source_value
+                    service.resolve_authorized_datasource(
+                        current_user.id,
+                        source.id,
+                        QUERY_DATA,
+                    )
+                    st.session_state.active_datasource_id = source.id
+                    _clear_query_state()
+                    active_id = source.id
                     st.rerun()
 
-            with delete_column:
-                if st.button(
-                    "×",
-                    key=f"delete_database_item_{source_index}",
-                    help=f"删除数据库：{database_display_name(source)}",
-                ):
-                    _confirm_database_deletion(source_value)
+            if delete_column is not None:
+                with delete_column:
+                    if st.button(
+                        "×",
+                        key=(
+                            "delete_database_item_"
+                            f"{current_user.id}_{source.id}"
+                        ),
+                        help=f"删除数据库：{source.display_name}",
+                    ):
+                        _confirm_database_deletion(
+                            source.id,
+                            current_user.id,
+                            current_user.session_version,
+                        )
 
-        active_database = Path(active_value) if active_value else None
+        active_source = source_by_id.get(active_id)
 
-        if active_database is None:
-            st.info("暂无可用数据库，请点击“＋”添加数据库。")
+        if active_source is None:
+            if can_import:
+                st.info("暂无可用数据源，请点击“＋”添加数据。")
         else:
             try:
-                catalog = inspect_sqlite_database(active_database)
+                active_source = service.resolve_authorized_datasource(
+                    current_user.id,
+                    active_source.id,
+                    QUERY_DATA,
+                )
+                catalog = inspect_sqlite_database(active_source.path)
                 st.caption(f"{len(catalog['tables'])} 张数据表")
                 for table in catalog["tables"]:
                     with st.expander(f"{table['name']}"):
@@ -731,10 +1016,11 @@ def render_sidebar() -> Path | None:
                                 f"{column['type']}{key_marker}</span>",
                                 unsafe_allow_html=True,
                             )
-            except DataSourceError as error:
+            except (AuthError, DataSourceError) as error:
                 st.error(str(error))
+                active_source = None
 
-    return active_database
+    return active_source
 
 
 # 判断数据库字段是否为数值类型（计算及柱状图）
@@ -764,10 +1050,14 @@ def _is_identifier_column(column_name: str) -> bool:
 # 获取数据库信息，识别字段信息，进行问题推荐
 @st.cache_data(show_spinner=False)
 def generate_suggested_questions(
+    datasource_id: int,
+    datasource_version: int,
     database_path: str,
     database_modified_at: int,
 ) -> List[str]:
-    del database_modified_at  # Included only to invalidate the cache on data updates.
+    # These values are part of the cache key so a replaced or re-registered
+    # source cannot reuse stale schema suggestions.
+    del datasource_id, datasource_version, database_modified_at
 
     manager = DatabaseManager(Path(database_path))
     table_names = manager.get_table_names()
@@ -908,51 +1198,73 @@ def queue_question_submission() -> None:
     st.session_state.question_draft = ""
 
 
-def render_question_input(database_path: Path | None) -> str | None:
+def render_question_input(
+    datasource: DataSourceRecord | None,
+    current_user: User,
+    service: AuthService,
+) -> str | None:
     suggestions: List[str] = []
-    if database_path is not None and database_path.is_file():
+    if datasource is not None:
+        try:
+            datasource = service.resolve_authorized_datasource(
+                current_user.id,
+                datasource.id,
+                QUERY_DATA,
+            )
+        except AuthError as error:
+            st.error(str(error))
+            datasource = None
+
+    if datasource is not None and datasource.path.is_file():
+        database_path = datasource.path
         modified_at = database_path.stat().st_mtime_ns
         suggestions = generate_suggested_questions(
+            datasource.id,
+            datasource.version,
             str(database_path),
             modified_at,
         )
 
-        database_name = html.escape(
-            database_display_name(database_path)
-        )
+        database_name = html.escape(datasource.display_name)
         st.markdown(
             f'<div class="database-context">在「{database_name}」中提问</div>',
             unsafe_allow_html=True,
         )
     else:
-        st.info("暂无可用数据库，请先从数据目录添加数据库。")
+        if service.has_permission(current_user.id, IMPORT_DATASOURCE):
+            st.info("暂无可用数据库，请先从数据目录添加数据库。")
+        else:
+            st.info(
+                "暂无已授权的数据源，请联系系统管理员为当前账号授权。"
+            )
 
-    with st.form(
-        "question_form",
-        clear_on_submit=False,
-        border=False,
-    ):
-        text_column, send_column = st.columns(
-            [0.95, 0.05],
-            gap="small",
-            vertical_alignment="center",
-        )
-        with text_column:
-            typed_question = st.text_input(
-                "问题",
-                key="question_draft",
-                placeholder="请输入您的问题…",
-                label_visibility="collapsed",
-                disabled=database_path is None,
+    with st.container(key="question_composer"):
+        with st.form(
+            "question_form",
+            clear_on_submit=False,
+            border=False,
+        ):
+            text_column, send_column = st.columns(
+                [0.95, 0.05],
+                gap="small",
+                vertical_alignment="center",
             )
-        with send_column:
-            submitted = st.form_submit_button(
-                "↑",
-                help="发送",
-                on_click=queue_question_submission,
-                use_container_width=False,
-                disabled=database_path is None,
-            )
+            with text_column:
+                st.text_input(
+                    "问题",
+                    key="question_draft",
+                    placeholder="请输入您的问题…",
+                    label_visibility="collapsed",
+                    disabled=datasource is None,
+                )
+            with send_column:
+                submitted = st.form_submit_button(
+                    "↑",
+                    help="发送",
+                    on_click=queue_question_submission,
+                    use_container_width=False,
+                    disabled=datasource is None,
+                )
 
     if suggestions:
         st.markdown(
@@ -962,7 +1274,10 @@ def render_question_input(database_path: Path | None) -> str | None:
         for index, suggestion in enumerate(suggestions):
             st.button(
                 suggestion,
-                key=f"suggested_question_{index}",
+                key=(
+                    f"suggested_question_{current_user.id}_"
+                    f"{datasource.id}_{index}"
+                ),
                 on_click=set_question_draft,
                 args=(suggestion,),
                 use_container_width=True,
@@ -1177,11 +1492,10 @@ def render_visualization(
     question: str = "",
 ):
     """
-    Render a chart for every non-empty query result.
+    Render a chart when the visualization specification recommends one.
 
     If the model returns an invalid or incomplete chart specification, select
-    a deterministic fallback from the result columns instead of showing only
-    a table.
+    a deterministic fallback from the result columns.
     
     Args:
         results: Query results
@@ -1189,6 +1503,9 @@ def render_visualization(
     """
     if not results:
         st.info("没有可用于生成图表的数据。")
+        return
+
+    if str(viz_spec.get("chart_type", "")).lower() == "none":
         return
     
     # Convert to DataFrame
@@ -1433,21 +1750,60 @@ def render_visualization(
 
 
 def main():
-    # 初始化session state
-    if "results" not in st.session_state:
-        st.session_state.results = None
-    
-    # 渲染UI
+    auth_service = get_auth_service()
+    current_user = render_auth_gate(auth_service)
+    if current_user is None:
+        return
+
+    # Only a trusted data-source administrator may reconcile legacy files.
+    # Tombstoned registry rows remain authoritative and are never revived by
+    # this compatibility scan.
+    if auth_service.has_permission(
+        current_user.id,
+        MANAGE_DATASOURCE_ACCESS,
+    ):
+        filesystem_sources = list_database_sources()
+        auth_service.sync_datasources(
+            current_user.id,
+            current_user.session_version,
+            (
+                (path, database_display_name(path))
+                for path in filesystem_sources
+            )
+        )
+
+    page = render_account_sidebar(auth_service, current_user)
+    if page == "users":
+        render_user_management(auth_service, current_user)
+        return
+    if page == "audit":
+        render_audit_logs(auth_service, current_user)
+        return
+
+    workspace_page = st.radio(
+        "工作台页面",
+        options=("智能问数", "可视化大屏"),
+        horizontal=True,
+        key="workspace_page",
+        label_visibility="collapsed",
+    )
+    if workspace_page == "可视化大屏":
+        render_dashboard_page(auth_service, current_user)
+        return
+
     render_header()
-    active_database = render_sidebar()
-    
-    question = render_question_input(active_database)
+    active_datasource = render_sidebar(current_user, auth_service)
+    question = render_question_input(
+        active_datasource,
+        current_user,
+        auth_service,
+    )
     
     # Handle form submission
     if question:
-        if active_database is None:
+        if active_datasource is None:
             st.error("请先从数据目录添加并选择数据库。")
-            st.session_state.results = None
+            _clear_query_state(clear_draft=False)
             return
 
         # Validate and sanitize input
@@ -1455,14 +1811,16 @@ def main():
         
         if not is_valid:
             st.error(f"输入内容无效：{error_msg}")
-            st.session_state.results = None
+            _clear_query_state(clear_draft=False)
         else:
-            # Run agent with sanitized question
+            query_service = AuthorizedQueryService(auth_service)
             with st.spinner("正在分析问题…"):
                 try:
-                    result_state = run_agent(
-                        sanitized_question,
-                        active_database,
+                    result_state, authorized_source = query_service.execute(
+                        user_id=current_user.id,
+                        session_version=current_user.session_version,
+                        datasource_id=active_datasource.id,
+                        question=sanitized_question,
                     )
                     
                     # Validate results before storing
@@ -1470,19 +1828,59 @@ def main():
                         is_valid_results, validation_error = result_validator.validate_results(result_state.query_result)
                         if not is_valid_results:
                             st.error(f"查询结果校验失败：{validation_error}")
-                            st.session_state.results = None
+                            _clear_query_state(clear_draft=False)
                             return
                     
                     st.session_state.results = result_state
+                    st.session_state.results_owner_user_id = current_user.id
+                    st.session_state.results_datasource_id = (
+                        authorized_source.id
+                    )
+                    st.session_state.results_datasource_version = (
+                        authorized_source.version
+                    )
                     
+                except AuthError as error:
+                    _clear_query_state(clear_draft=False)
+                    st.error(str(error))
                 except Exception as e:
                     print(f"[ERROR] Query processing error: {e}")
                     st.error("处理问题时发生错误，请稍后重试。")
-                    st.session_state.results = None
+                    _clear_query_state(clear_draft=False)
     
     # Display results
-    if st.session_state.results:
-        state = st.session_state.results
+    state = st.session_state.get("results")
+    if state:
+        owns_results = (
+            st.session_state.get("results_owner_user_id")
+            == current_user.id
+            and active_datasource is not None
+            and st.session_state.get("results_datasource_id")
+            == active_datasource.id
+            and st.session_state.get("results_datasource_version")
+            == active_datasource.version
+        )
+        if not owns_results:
+            _clear_query_state(clear_draft=False)
+            st.warning("数据源或账号权限已变化，请重新发起查询。")
+            return
+        try:
+            current_source = auth_service.resolve_authorized_datasource(
+                current_user.id,
+                active_datasource.id,
+                QUERY_DATA,
+            )
+            if (
+                st.session_state.get("results_datasource_version")
+                != current_source.version
+            ):
+                _clear_query_state(clear_draft=False)
+                st.warning("数据源已更新，请重新发起查询。")
+                return
+        except AuthError as error:
+            _clear_query_state(clear_draft=False)
+            st.error(str(error))
+            return
         
         # 检查问题相关性
         if not state.is_relevant:
@@ -1531,14 +1929,46 @@ def main():
         
         # 结果展示
         if state.query_result:
-            st.subheader("查询结果")
-            
             viz_spec = state.visualization_spec or {"chart_type": "bar"}
-            render_visualization(
-                state.query_result,
-                viz_spec,
-                state.question,
-            )
+            if str(viz_spec.get("chart_type", "")).lower() != "none":
+                st.subheader("数据可视化")
+                render_visualization(
+                    state.query_result,
+                    viz_spec,
+                    state.question,
+                )
+
+            if st.button(
+                "＋ 添加到可视化大屏",
+                key="add_current_result_to_dashboard",
+                type="primary",
+            ):
+                try:
+                    chart_title = _chinese_chart_title(
+                        viz_spec.get("title", ""),
+                        state.question,
+                    )
+                    saved_query, placed = save_result_and_place(
+                        auth_service=auth_service,
+                        current_user=current_user,
+                        datasource_id=current_source.id,
+                        datasource_version=current_source.version,
+                        title=chart_title,
+                        question=state.question,
+                        sql_query=state.sql_query,
+                        visualization_spec=viz_spec,
+                    )
+                    if placed:
+                        st.success(
+                            f"“{saved_query.title}”已添加到可视化大屏。"
+                        )
+                    else:
+                        st.info(
+                            f"“{saved_query.title}”已保存。当前大屏没有空格，"
+                            "请进入编辑模式分割区域后，通过“＋”添加。"
+                        )
+                except AuthError as error:
+                    st.error(str(error))
             
             # 结果行数展示
             row_count = len(state.query_result)

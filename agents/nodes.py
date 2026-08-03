@@ -6,6 +6,7 @@ from typing import Dict, Any
 
 from agents.state import AgentState
 from infrastructure.llm import (
+    extract_response_text,
     get_router_llm,
     get_sql_generator_llm,
     get_reflector_llm,
@@ -47,7 +48,7 @@ async def intent_router_node(state: AgentState) -> Dict[str, Any]:
     try:
         # 异步调用模型，读取并统一模型回答
         response = await llm.ainvoke(prompt)
-        response_text = response.content.strip().upper()
+        response_text = extract_response_text(response).strip().upper()
         
         # 判断是否相关
         is_relevant = "RELEVANT" in response_text and "NOT_RELEVANT" not in response_text
@@ -62,7 +63,10 @@ async def intent_router_node(state: AgentState) -> Dict[str, Any]:
         
     except Exception as e:
         # 发生错误时，默认认为问题相关，并交给后续节点处理
-        print(f"[WARNING] Intent router error: {e}")
+        print(
+            "[WARNING] Intent router error_type="
+            f"{e.__class__.__name__}"
+        )
         return {
             "is_relevant": True,
             "final_response": ""
@@ -81,7 +85,7 @@ async def sql_generator_node(state: AgentState) -> Dict[str, Any]:
     
     try:
         response = await llm.ainvoke(prompt)
-        response_text = response.content
+        response_text = extract_response_text(response)
         
         # 提取推理过程，即 SQL 代码块之前的所有内容
         reasoning_match = re.search(
@@ -127,7 +131,9 @@ async def sql_generator_node(state: AgentState) -> Dict[str, Any]:
             "sql_query": "",
             "reasoning": "",
             "validation_passed": False,
-            "validation_error": f"SQL 生成失败：{str(e)}"
+            "validation_error": (
+                f"SQL 生成失败（{e.__class__.__name__}）。"
+            )
         }
 
 
@@ -269,7 +275,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     try:
         response = await llm.ainvoke(prompt)
-        response_text = response.content
+        response_text = extract_response_text(response)
         
         # Extract explanation
         explanation_match = re.search(
@@ -294,7 +300,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
             "error": ""  # Clear error for retry
         }
         
-    except Exception as e:
+    except Exception:
         return {
             "retry_count": retry_count,
             "final_response": "SQL 自动修正失败，请调整问题后重试。"
@@ -344,7 +350,7 @@ async def visualizer_node(state: AgentState) -> Dict[str, Any]:
     
     try:
         response = await llm.ainvoke(prompt)
-        response_text = response.content.strip()
+        response_text = extract_response_text(response).strip()
         
         # 解析 JSON 格式的回答
         # 清理可能存在的 Markdown 代码块标记
@@ -380,7 +386,10 @@ async def visualizer_node(state: AgentState) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        print(f"[WARNING] Visualization error: {e}")
+        print(
+            "[WARNING] Visualization error_type="
+            f"{e.__class__.__name__}"
+        )
         return {
             "visualization_spec": {
                 "chart_type": "bar",

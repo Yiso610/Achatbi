@@ -15,7 +15,19 @@ import sys
 from pathlib import Path
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def get_test_database_path() -> Path:
+    """Use a database source added through the same flow as the application."""
+    from infrastructure.data_sources import list_database_sources
+
+    sources = list_database_sources()
+    if not sources:
+        raise RuntimeError(
+            "No database source is available. Add one from the data catalog first."
+        )
+    return sources[0]
 
 
 def test_configuration():
@@ -25,8 +37,12 @@ def test_configuration():
         from infrastructure.config import get_config
         config = get_config()
         print(f"   [PASS] Config loaded successfully")
-        print(f"   - SQL Generator: {config.sql_generator_model}")
-        print(f"   - Router: {config.router_model}")
+        for role in ("router", "sql_generator", "reflector", "visualizer"):
+            chain = " -> ".join(
+                f"{target.provider}:{target.model}"
+                for target in config.get_model_chain(role)
+            )
+            print(f"   - {role}: {chain}")
         print(f"   - Max Retries: {config.max_retry_count}")
         return True
     except Exception as e:
@@ -39,24 +55,33 @@ def test_database():
     print("\n[TEST] Database...")
     try:
         from infrastructure.db_manager import DatabaseManager
-        db = DatabaseManager()
+        database_path = get_test_database_path()
+        db = DatabaseManager(database_path)
         
         # Test schema retrieval
         schema = db.get_annotated_schema()
         print(f"   [PASS] Database connected")
+        print(f"   - Source: {database_path.name}")
         
         # Test table listing
         tables = db.get_table_names()
         print(f"   - Found {len(tables)} tables: {', '.join(tables[:5])}...")
         
         # Test simple query
-        results, error = db.execute_query("SELECT COUNT(*) as count FROM Artist")
+        if not tables:
+            print("   [FAIL] No business tables found")
+            return False
+
+        table = tables[0]
+        results, error = db.execute_query(
+            f'SELECT COUNT(*) as count FROM "{table}"'
+        )
         if error:
             print(f"   [FAIL] Query failed: {error}")
             return False
         else:
             count = results[0]['count']
-            print(f"   - Artist count: {count}")
+            print(f"   - {table} row count: {count}")
         
         return True
     except Exception as e:
@@ -81,7 +106,10 @@ def test_llm():
         return True
     except Exception as e:
         print(f"   [FAIL] LLM initialization failed: {e}")
-        print(f"   [INFO] Check your GOOGLE_API_KEY in .env file")
+        print(
+            "   [INFO] Check the provider keys and *_MODEL_CHAIN "
+            "settings in your .env file"
+        )
         return False
 
 
@@ -92,27 +120,27 @@ def test_basic_workflow():
         from agents.graph import run_agent
         
         # Test with a simple question
-        question = "Show me the top 5 artists"
+        question = "按品牌统计测点数量，并按数量从高到低排列"
         print(f"   Question: '{question}'")
         
-        result = run_agent(question)
+        result = run_agent(question, get_test_database_path())
         
-        if result["is_relevant"]:
+        if result.is_relevant:
             print(f"   [PASS] Intent routing: RELEVANT")
         else:
             print(f"   [FAIL] Intent routing failed")
             return False
         
-        if result["sql_query"]:
+        if result.sql_query:
             print(f"   [PASS] SQL generated")
-            print(f"   - Query: {result['sql_query'][:50]}...")
+            print(f"   - Query: {result.sql_query[:50]}...")
         else:
             print(f"   [FAIL] SQL generation failed")
             return False
         
-        if result["query_result"]:
+        if result.query_result:
             print(f"   [PASS] Query executed successfully")
-            print(f"   - Results: {len(result['query_result'])} rows")
+            print(f"   - Results: {len(result.query_result)} rows")
         else:
             print(f"   [WARNING] Query returned no results")
         
@@ -134,11 +162,11 @@ def test_error_handling():
         question = "What is the capital of France?"
         print(f"   Question: '{question}'")
         
-        result = run_agent(question)
+        result = run_agent(question, get_test_database_path())
         
-        if not result["is_relevant"]:
+        if not result.is_relevant:
             print(f"   [PASS] Correctly identified as irrelevant")
-            print(f"   - Response: {result['final_response'][:50]}...")
+            print(f"   - Response: {result.final_response[:50]}...")
             return True
         else:
             print(f"   [FAIL] Should have been marked irrelevant")

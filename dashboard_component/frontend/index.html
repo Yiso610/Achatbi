@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="./plotly.min.js"></script>
+  <script src="./streamlit_bridge.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      --ink: #172033;
+      --muted: #6d778b;
+      --line: #dce3ee;
+      --blue: #2d6cdf;
+      --blue-soft: #eef4ff;
+      --canvas: #f2f5fa;
+      --card: #ffffff;
+      --danger: #d94a4a;
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; margin: 0; background: transparent; }
+    button { font: inherit; }
+    #app {
+      width: 100%;
+      min-height: 820px;
+      background:
+        radial-gradient(circle at 12% 5%, rgba(79, 125, 220, .10), transparent 24rem),
+        var(--canvas);
+      border: 1px solid #e0e6ef;
+      border-radius: 18px;
+      overflow: hidden;
+      color: var(--ink);
+    }
+    #app:fullscreen {
+      width: 100vw;
+      height: 100vh;
+      min-height: 100vh;
+      border: 0;
+      border-radius: 0;
+    }
+    .topbar {
+      height: 56px;
+      padding: 0 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      background: rgba(255, 255, 255, .96);
+      border-bottom: 1px solid var(--line);
+    }
+    .title-wrap {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .title {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      font-weight: 750;
+      letter-spacing: .01em;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #24a36a;
+      box-shadow: 0 0 0 4px rgba(36, 163, 106, .10);
+    }
+    .toolbar { display: flex; align-items: center; gap: 8px; }
+    .tool-button {
+      height: 32px;
+      padding: 0 12px;
+      border-radius: 9px;
+      border: 1px solid var(--line);
+      background: white;
+      color: #354158;
+      cursor: pointer;
+      transition: .15s ease;
+    }
+    .tool-button:hover {
+      border-color: #aebbd0;
+      background: #f8faff;
+    }
+    .tool-button:disabled,
+    .tool-button:disabled:hover {
+      color: #9aa4b4;
+      border-color: #e0e5ed;
+      background: #f5f7fa;
+      cursor: not-allowed;
+      opacity: .72;
+    }
+    .tool-button.primary {
+      color: white;
+      background: var(--blue);
+      border-color: var(--blue);
+    }
+    .tool-button.primary:hover { background: #225cc5; }
+    .dashboard {
+      height: 764px;
+      padding: 12px;
+      overflow: hidden;
+    }
+    #app:fullscreen .topbar {
+      height: 48px;
+      padding: 0 12px;
+    }
+    #app:fullscreen .dashboard { height: calc(100vh - 48px); }
+    .node, .pane { min-width: 0; min-height: 0; }
+    .node.split {
+      display: flex;
+      width: 100%;
+      height: 100%;
+    }
+    .node.split.horizontal { flex-direction: row; }
+    .node.split.vertical { flex-direction: column; }
+    .pane {
+      position: relative;
+      overflow: hidden;
+      padding: 4px;
+    }
+    .divider {
+      flex: 0 0 6px;
+      position: relative;
+      z-index: 10;
+    }
+    .edit .divider { background: transparent; }
+    .edit .split.horizontal > .divider { cursor: col-resize; }
+    .edit .split.vertical > .divider { cursor: row-resize; }
+    .edit .divider::after {
+      content: "";
+      position: absolute;
+      inset: 20% 2px;
+      border-radius: 10px;
+      background: #c6d0df;
+      opacity: 0;
+      transition: opacity .15s;
+    }
+    .edit .split.vertical > .divider::after { inset: 2px 20%; }
+    .edit .divider:hover::after { opacity: 1; }
+    .slot {
+      width: 100%;
+      height: 100%;
+      position: relative;
+      overflow: hidden;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 0 3px 12px rgba(30, 49, 80, .055);
+    }
+    .edit .slot {
+      border-style: dashed;
+      border-color: #b8c6da;
+    }
+    .slot.drag-over {
+      border: 2px solid var(--blue);
+      background: var(--blue-soft);
+    }
+    .empty-slot {
+      display: grid;
+      place-items: center;
+      background:
+        linear-gradient(135deg, rgba(245, 248, 253, .82), rgba(255,255,255,.96));
+    }
+    .plus-button {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      border: 1px solid #c8d4e5;
+      color: var(--blue);
+      background: white;
+      font-size: 28px;
+      line-height: 1;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(45, 108, 223, .10);
+    }
+    .empty-hint {
+      margin-top: 10px;
+      color: #8a94a7;
+      font-size: 12px;
+    }
+    .chart-card {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+    }
+    .card-header {
+      flex: 0 0 auto;
+      min-height: 45px;
+      padding: 9px 12px 6px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+      border-bottom: 1px solid #edf0f5;
+      cursor: default;
+    }
+    .edit .card-header { cursor: grab; }
+    .edit .card-header:active { cursor: grabbing; }
+    .card-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 14px;
+      font-weight: 680;
+    }
+    .card-meta {
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    .card-source {
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 20px;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .delete-button {
+      display: none;
+      flex: 0 0 25px;
+      width: 25px;
+      height: 25px;
+      padding: 0;
+      border: 1px solid #f0c9c9;
+      border-radius: 7px;
+      background: #fff7f7;
+      color: var(--danger);
+      font-size: 17px;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .edit .delete-button {
+      display: inline-grid;
+      place-items: center;
+    }
+    .delete-button:hover {
+      background: #ffeaea;
+      border-color: #e9aaaa;
+    }
+    .chart-host {
+      flex: 1 1 auto;
+      min-height: 0;
+      width: 100%;
+    }
+    .edit .chart-host {
+      pointer-events: none;
+      user-select: none;
+    }
+    .error-state, .empty-data {
+      height: 100%;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+    .error-state { color: var(--danger); }
+    .data-table-wrap {
+      height: 100%;
+      overflow: auto;
+      padding: 4px 8px 8px;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: #516078;
+      background: #f5f7fb;
+      font-weight: 650;
+    }
+    th, td {
+      max-width: 220px;
+      padding: 7px 8px;
+      border-bottom: 1px solid #edf0f5;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: left;
+    }
+    .slot-actions {
+      display: none;
+      position: absolute;
+      right: 8px;
+      bottom: 8px;
+      z-index: 20;
+      align-items: center;
+      gap: 5px;
+    }
+    .edit .slot:hover > .slot-actions {
+      display: flex;
+    }
+    .split-button {
+      height: 27px;
+      padding: 0 8px;
+      border: 1px solid #abc3eb;
+      border-radius: 7px;
+      background: rgba(255, 255, 255, .96);
+      color: #245fbd;
+      font-size: 10px;
+      line-height: 25px;
+      cursor: pointer;
+      box-shadow: 0 3px 10px rgba(34, 73, 135, .13);
+    }
+    .split-button:hover {
+      color: white;
+      background: var(--blue);
+      border-color: var(--blue);
+    }
+    .context-menu {
+      position: fixed;
+      z-index: 1000;
+      min-width: 128px;
+      padding: 5px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: white;
+      box-shadow: 0 12px 32px rgba(20, 34, 60, .18);
+    }
+    .context-menu button {
+      width: 100%;
+      padding: 9px 11px;
+      text-align: left;
+      color: var(--danger);
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      cursor: pointer;
+    }
+    .context-menu button:hover { background: #fff1f1; }
+    .editing-note {
+      color: #b56b10;
+      background: #fff7e8;
+      border: 1px solid #f3d6a3;
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 11px;
+    }
+    @media (max-width: 900px) {
+      .topbar { padding: 0 14px; }
+      .title { font-size: 18px; }
+      .status .secondary { display: none; }
+      .tool-button { padding: 0 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    const app = document.getElementById("app");
+    let currentArgs = {};
+    let currentPayload = {};
+    let editMode = false;
+    let draggingSlot = null;
+    let contextMenu = null;
+    let resizeState = null;
+    let touchState = null;
+    let refreshTimer = null;
+
+    const emit = (action, detail = {}) => {
+      window.ChatBIStreamlit.setComponentValue(
+        JSON.stringify({
+          action,
+          ...detail,
+          event_id: `${Date.now()}-${Math.random().toString(16).slice(2)}`
+        })
+      );
+    };
+    const setHeight = () => {
+      const height = app.matches(":fullscreen") ? window.innerHeight : 830;
+      window.ChatBIStreamlit.setFrameHeight(height);
+    };
+    const escapeHtml = (value) => String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+
+    function closeContextMenu() {
+      if (contextMenu) contextMenu.remove();
+      contextMenu = null;
+    }
+
+    function showContextMenu(event, slotId) {
+      if (!editMode) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeContextMenu();
+      const menu = document.createElement("div");
+      menu.className = "context-menu";
+      menu.style.left = `${Math.min(event.clientX, window.innerWidth - 145)}px`;
+      menu.style.top = `${Math.min(event.clientY, window.innerHeight - 60)}px`;
+      const button = document.createElement("button");
+      button.textContent = "删除图表";
+      button.onclick = () => {
+        closeContextMenu();
+        emit("delete", { slot_id: slotId });
+      };
+      menu.appendChild(button);
+      document.body.appendChild(menu);
+      contextMenu = menu;
+    }
+
+    function renderTable(host, rows) {
+      if (!rows || !rows.length) {
+        host.innerHTML = '<div class="empty-data">当前查询没有返回数据</div>';
+        return;
+      }
+      const columns = Object.keys(rows[0]).slice(0, 12);
+      const html = [
+        '<div class="data-table-wrap"><table><thead><tr>',
+        ...columns.map(c => `<th>${escapeHtml(c)}</th>`),
+        '</tr></thead><tbody>',
+        ...rows.slice(0, 50).map(row => (
+          '<tr>' + columns.map(c => `<td title="${escapeHtml(row[c])}">${escapeHtml(row[c])}</td>`).join("") + '</tr>'
+        )),
+        '</tbody></table></div>'
+      ].join("");
+      host.innerHTML = html;
+    }
+
+    function normalizedChart(widget) {
+      const rows = widget.rows || [];
+      const spec = widget.visualization_spec || {};
+      let type = String(spec.chart_type || "table").toLowerCase();
+      const allowed = ["bar", "line", "pie", "scatter", "heatmap"];
+      if (!allowed.includes(type)) type = "table";
+      if (!rows.length) return { type: "empty" };
+      const columns = Object.keys(rows[0]);
+      const numeric = columns.filter(column =>
+        rows.some(row => row[column] !== null && row[column] !== "" && Number.isFinite(Number(row[column])))
+      );
+      const category = columns.filter(column => !numeric.includes(column));
+      let x = spec.x_column;
+      let y = spec.y_column;
+      let z = spec.z_column;
+      if (!columns.includes(x)) x = category[0] || columns[0];
+      if (!numeric.includes(y) || y === x) y = numeric.find(column => column !== x);
+      if (!y && type !== "table") type = "table";
+      if (type === "scatter" && !numeric.includes(x)) {
+        x = numeric[0];
+        y = numeric[1];
+        if (!x || !y) type = "table";
+      }
+      if (type === "heatmap" && (!columns.includes(x) || !columns.includes(y) || !numeric.includes(z))) {
+        type = "table";
+      }
+      return { type, x, y, z };
+    }
+
+    function drawChart(host, widget) {
+      if (widget.error) {
+        host.innerHTML = `<div class="error-state">${escapeHtml(widget.error)}</div>`;
+        return;
+      }
+      const rows = widget.rows || [];
+      const chart = normalizedChart(widget);
+      if (chart.type === "empty") {
+        host.innerHTML = '<div class="empty-data">当前查询没有返回数据</div>';
+        return;
+      }
+      if (chart.type === "table" || typeof Plotly === "undefined") {
+        renderTable(host, rows);
+        return;
+      }
+      const xValues = rows.map(row => row[chart.x]);
+      const yValues = rows.map(row => Number(row[chart.y]));
+      let data;
+      if (chart.type === "pie") {
+        data = [{
+          type: "pie",
+          labels: xValues,
+          values: yValues,
+          hole: .34,
+          textinfo: "label+percent",
+          marker: { colors: ["#3976db", "#62a7e8", "#70c6aa", "#f3b562", "#de7182", "#8976d3"] }
+        }];
+      } else if (chart.type === "line") {
+        data = [{
+          type: "scatter",
+          mode: "lines+markers",
+          x: xValues,
+          y: yValues,
+          line: { color: "#2d6cdf", width: 3 },
+          marker: { color: "#fff", line: { color: "#2d6cdf", width: 2 }, size: 7 }
+        }];
+      } else if (chart.type === "scatter") {
+        data = [{
+          type: "scatter",
+          mode: "markers",
+          x: xValues.map(Number),
+          y: yValues,
+          marker: { color: "#2d6cdf", size: 8, opacity: .76 }
+        }];
+      } else if (chart.type === "heatmap") {
+        const xLabels = [...new Set(rows.map(row => String(row[chart.x])))];
+        const yLabels = [...new Set(rows.map(row => String(row[chart.y])))];
+        const lookup = new Map(rows.map(row => [
+          `${String(row[chart.x])}\u0000${String(row[chart.y])}`,
+          Number(row[chart.z])
+        ]));
+        data = [{
+          type: "heatmap",
+          x: xLabels,
+          y: yLabels,
+          z: yLabels.map(y => xLabels.map(x => lookup.get(`${x}\u0000${y}`) ?? null)),
+          colorscale: "Blues"
+        }];
+      } else {
+        data = [{
+          type: "bar",
+          x: xValues,
+          y: yValues,
+          marker: { color: "#4c83df" }
+        }];
+      }
+      Plotly.react(host, data, {
+        autosize: true,
+        margin: { l: 44, r: 14, t: 12, b: 42 },
+        paper_bgcolor: "rgba(0,0,0,0)",
+        plot_bgcolor: "rgba(0,0,0,0)",
+        font: { family: 'Inter, "PingFang SC", sans-serif', size: 11, color: "#536077" },
+        xaxis: { automargin: true, gridcolor: "#edf0f5" },
+        yaxis: { automargin: true, gridcolor: "#edf0f5", rangemode: chart.type === "bar" ? "tozero" : "normal" },
+        showlegend: chart.type === "pie"
+      }, {
+        displayModeBar: false,
+        responsive: true,
+        staticPlot: editMode,
+        scrollZoom: false
+      });
+    }
+
+    function addSplitActions(slot, slotId) {
+      const allowed = currentPayload.split_capabilities?.[slotId] || [];
+      const options = [];
+      if (allowed.includes("right")) {
+        options.push({ edge: "right", label: "↔ 左右分割" });
+      }
+      if (allowed.includes("bottom")) {
+        options.push({ edge: "bottom", label: "↕ 上下分割" });
+      }
+      if (!options.length) return;
+
+      const actions = document.createElement("div");
+      actions.className = "slot-actions";
+      options.forEach(option => {
+        const button = document.createElement("button");
+        button.className = "split-button";
+        button.textContent = option.label;
+        button.title = `将当前格子${option.label.slice(2)}`;
+        button.onclick = event => {
+          event.stopPropagation();
+          emit("split", { slot_id: slotId, edge: option.edge });
+        };
+        actions.appendChild(button);
+      });
+      slot.appendChild(actions);
+    }
+
+    function beginTouchDrag(event, slotId) {
+      if (!editMode || event.pointerType !== "touch") return;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const timer = setTimeout(() => {
+        touchState = { slotId, active: true, x: startX, y: startY };
+        navigator.vibrate?.(25);
+      }, 450);
+      touchState = { slotId, active: false, timer, x: startX, y: startY };
+    }
+
+    function createSlot(node) {
+      const slot = document.createElement("div");
+      slot.className = "node slot";
+      slot.dataset.slotId = node.id;
+      const widget = currentPayload.widgets?.[String(node.widget_id)];
+      if (!widget) {
+        slot.classList.add("empty-slot");
+        if (editMode) {
+          const wrap = document.createElement("div");
+          wrap.style.textAlign = "center";
+          wrap.innerHTML = '<button class="plus-button" title="添加保存的查询图表">＋</button><div class="empty-hint">添加查询图表</div>';
+          wrap.querySelector("button").onclick = event => {
+            event.stopPropagation();
+            emit("add", { slot_id: node.id });
+          };
+          slot.appendChild(wrap);
+        } else {
+          slot.innerHTML = '<div class="empty-data">暂无内容</div>';
+        }
+      } else {
+        const card = document.createElement("div");
+        card.className = "chart-card";
+        const header = document.createElement("div");
+        header.className = "card-header";
+        header.innerHTML = `<div class="card-meta"><div class="card-title" title="${escapeHtml(widget.title)}">${escapeHtml(widget.title)}</div><div class="card-source" title="${escapeHtml(widget.datasource_name)}">${escapeHtml(widget.datasource_name)}</div></div><button class="delete-button" title="删除图表">×</button>`;
+        const host = document.createElement("div");
+        host.className = "chart-host";
+        host.id = `chart-${node.id}`;
+        card.appendChild(header);
+        card.appendChild(host);
+        slot.appendChild(card);
+        requestAnimationFrame(() => drawChart(host, widget));
+        if (editMode) {
+          const deleteButton = header.querySelector(".delete-button");
+          deleteButton.addEventListener("click", event => {
+            event.preventDefault();
+            event.stopPropagation();
+            emit("delete", { slot_id: node.id });
+          });
+          header.draggable = true;
+          header.addEventListener("dragstart", event => {
+            draggingSlot = node.id;
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", node.id);
+          });
+          header.addEventListener("dragend", () => { draggingSlot = null; });
+          header.addEventListener("pointerdown", event => beginTouchDrag(event, node.id));
+          slot.addEventListener("contextmenu", event => showContextMenu(event, node.id));
+        }
+      }
+      if (editMode) {
+        addSplitActions(slot, node.id);
+        slot.addEventListener("dragover", event => {
+          if (!draggingSlot || draggingSlot === node.id) return;
+          event.preventDefault();
+          slot.classList.add("drag-over");
+        });
+        slot.addEventListener("dragleave", () => slot.classList.remove("drag-over"));
+        slot.addEventListener("drop", event => {
+          event.preventDefault();
+          slot.classList.remove("drag-over");
+          const source = draggingSlot || event.dataTransfer.getData("text/plain");
+          if (source && source !== node.id) {
+            emit("move", { source_slot_id: source, target_slot_id: node.id });
+          }
+          draggingSlot = null;
+        });
+      }
+      return slot;
+    }
+
+    function startResize(event, splitNode, dividerIndex, splitElement) {
+      if (!editMode) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const panes = [...splitElement.children].filter(child => child.classList.contains("pane"));
+      const sizes = (splitNode.sizes || panes.map(() => 1)).map(Number);
+      const before = panes[dividerIndex];
+      const after = panes[dividerIndex + 1];
+      const beforeRect = before.getBoundingClientRect();
+      const afterRect = after.getBoundingClientRect();
+      resizeState = {
+        pointerId: event.pointerId,
+        splitNode,
+        splitElement,
+        panes,
+        dividerIndex,
+        sizes,
+        start: splitNode.direction === "horizontal" ? event.clientX : event.clientY,
+        beforePixels: splitNode.direction === "horizontal" ? beforeRect.width : beforeRect.height,
+        afterPixels: splitNode.direction === "horizontal" ? afterRect.width : afterRect.height,
+      };
+      event.target.setPointerCapture?.(event.pointerId);
+    }
+
+    function createNode(node) {
+      if (node.kind === "slot") return createSlot(node);
+      const split = document.createElement("div");
+      split.className = `node split ${node.direction}`;
+      split.dataset.nodeId = node.id;
+      const sizes = node.sizes || node.children.map(() => 1);
+      node.children.forEach((child, index) => {
+        const pane = document.createElement("div");
+        pane.className = "pane";
+        pane.style.flexGrow = String(sizes[index] || 1);
+        pane.style.flexBasis = "0";
+        pane.appendChild(createNode(child));
+        split.appendChild(pane);
+        if (index < node.children.length - 1) {
+          const divider = document.createElement("div");
+          divider.className = "divider";
+          divider.addEventListener("pointerdown", event => startResize(event, node, index, split));
+          split.appendChild(divider);
+        }
+      });
+      return split;
+    }
+
+    function render() {
+      closeContextMenu();
+      currentPayload = currentArgs.payload || {};
+      editMode = Boolean(currentArgs.editMode);
+      app.className = editMode ? "edit" : "";
+      app.innerHTML = "";
+
+      const topbar = document.createElement("div");
+      topbar.className = "topbar";
+      const statusText = currentPayload.refresh_time
+        ? `数据更新于 ${escapeHtml(currentPayload.refresh_time)}`
+        : "等待数据刷新";
+      topbar.innerHTML = `
+        <div class="title-wrap">
+          <h1 class="title">${escapeHtml(currentPayload.title || "可视化数据大屏")}</h1>
+          <div class="status"><span class="status-dot"></span><span>${statusText}</span><span class="secondary">· 每 5 分钟自动刷新</span></div>
+        </div>
+        <div class="toolbar">
+          ${editMode ? `<span class="editing-note">${currentPayload.dirty ? "有未保存修改" : "正在编辑"}</span><button class="tool-button" data-action="cancel">退出编辑</button><button class="tool-button" data-action="undo" title="撤回上一步布局操作"${currentPayload.can_undo ? "" : " disabled"}>撤回</button><button class="tool-button primary" data-action="save">保存</button>` : '<button class="tool-button" data-action="fullscreen">全屏</button><button class="tool-button primary" data-action="edit">编辑</button>'}
+        </div>
+      `;
+      app.appendChild(topbar);
+      topbar.querySelector('[data-action="edit"]')?.addEventListener("click", event => {
+        event.currentTarget.textContent = "正在进入…";
+        emit("enter_edit");
+      });
+      topbar.querySelector('[data-action="save"]')?.addEventListener("click", () => emit("save"));
+      topbar.querySelector('[data-action="cancel"]')?.addEventListener("click", () => emit("cancel"));
+      topbar.querySelector('[data-action="undo"]')?.addEventListener("click", () => emit("undo"));
+      topbar.querySelector('[data-action="fullscreen"]')?.addEventListener("click", async () => {
+        if (!document.fullscreenElement) await app.requestFullscreen?.();
+        else await document.exitFullscreen?.();
+      });
+
+      const dashboard = document.createElement("div");
+      dashboard.className = "dashboard";
+      if (currentPayload.layout) dashboard.appendChild(createNode(currentPayload.layout));
+      else dashboard.innerHTML = '<div class="empty-data">大屏布局加载失败</div>';
+      app.appendChild(dashboard);
+      setHeight();
+    }
+
+    window.ChatBIStreamlit.events.addEventListener(
+      window.ChatBIStreamlit.RENDER_EVENT,
+      event => {
+      currentArgs = event.detail.args || {};
+      render();
+      }
+    );
+    document.addEventListener("click", closeContextMenu);
+    document.addEventListener("fullscreenchange", setHeight);
+    window.addEventListener("resize", () => {
+      setHeight();
+      document.querySelectorAll(".chart-host").forEach(host => {
+        if (typeof Plotly !== "undefined") Plotly.Plots.resize(host);
+      });
+    });
+    window.addEventListener("pointermove", event => {
+      if (resizeState) {
+        const horizontal = resizeState.splitNode.direction === "horizontal";
+        const current = horizontal ? event.clientX : event.clientY;
+        const delta = current - resizeState.start;
+        const firstPixels = Math.max(120, resizeState.beforePixels + delta);
+        const secondPixels = Math.max(120, resizeState.afterPixels - delta);
+        const pairSize = resizeState.sizes[resizeState.dividerIndex] + resizeState.sizes[resizeState.dividerIndex + 1];
+        const ratio = firstPixels / (firstPixels + secondPixels);
+        const updated = [...resizeState.sizes];
+        updated[resizeState.dividerIndex] = pairSize * ratio;
+        updated[resizeState.dividerIndex + 1] = pairSize * (1 - ratio);
+        resizeState.panes.forEach((pane, index) => pane.style.flexGrow = String(updated[index]));
+        resizeState.nextSizes = updated;
+      }
+      if (touchState?.active) {
+        touchState.x = event.clientX;
+        touchState.y = event.clientY;
+        document.querySelectorAll(".slot").forEach(slot => slot.classList.remove("drag-over"));
+        const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(".slot");
+        if (target && target.dataset.slotId !== touchState.slotId) target.classList.add("drag-over");
+      }
+    });
+    window.addEventListener("pointerup", event => {
+      if (resizeState) {
+        const state = resizeState;
+        resizeState = null;
+        if (state.nextSizes) {
+          emit("resize", { split_id: state.splitNode.id, sizes: state.nextSizes });
+        }
+      }
+      if (touchState) {
+        clearTimeout(touchState.timer);
+        if (touchState.active) {
+          const target = document.elementFromPoint(event.clientX, event.clientY)?.closest(".slot");
+          document.querySelectorAll(".slot").forEach(slot => slot.classList.remove("drag-over"));
+          if (target && target.dataset.slotId !== touchState.slotId) {
+            emit("move", { source_slot_id: touchState.slotId, target_slot_id: target.dataset.slotId });
+          }
+        }
+        touchState = null;
+      }
+    });
+    window.addEventListener("pointercancel", () => {
+      if (touchState) clearTimeout(touchState.timer);
+      touchState = null;
+      resizeState = null;
+    });
+
+    window.ChatBIStreamlit.setComponentReady();
+    refreshTimer = window.setInterval(
+      () => emit("refresh"),
+      300000
+    );
+    setHeight();
+  </script>
+</body>
+</html>

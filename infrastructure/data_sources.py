@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from hashlib import sha256
+from io import BytesIO
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -13,8 +15,10 @@ import socket
 import sqlite3
 from typing import Any
 from uuid import uuid4
+from zipfile import BadZipFile, ZipFile
 
 import pymysql
+from openpyxl import load_workbook
 
 try:
     import psycopg2
@@ -25,8 +29,14 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UPLOAD_DIRECTORY = PROJECT_ROOT / "data" / "uploads"
 ALLOWED_DATABASE_EXTENSIONS = {".db", ".sqlite", ".sqlite3"}
+ALLOWED_EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 SQLITE_HEADER = b"SQLite format 3\x00"
 MAX_DATABASE_SIZE_BYTES = 100 * 1024 * 1024
+MAX_EXCEL_SIZE_BYTES = 20 * 1024 * 1024
+MAX_EXCEL_EXPANDED_SIZE_BYTES = 200 * 1024 * 1024
+MAX_EXCEL_SHEETS = 50
+MAX_EXCEL_ROWS = 250_000
+MAX_EXCEL_COLUMNS = 500
 REMOTE_DATABASE_TYPES = ("MySQL", "PostgreSQL")
 MYSQL_SYSTEM_DATABASES = {
     "information_schema",
@@ -45,6 +55,15 @@ class StagedDatabaseSnapshot:
     staged_path: Path
     target_path: Path
     display_name: str
+
+
+@dataclass(frozen=True)
+class _ExcelSheetSpec:
+    sheet_name: str
+    table_name: str
+    header_row_number: int
+    columns: tuple[dict[str, str], ...]
+    row_count: int
 
 
 # 保护数据库快照
@@ -216,6 +235,349 @@ def save_uploaded_database(original_name: str, content: bytes) -> Path:
         temporary_path.unlink(missing_ok=True)
 
     return target_path
+
+
+def _excel_value_is_empty(value: Any) -> bool:
+    return value is None or (
+        isinstance(value, str) and not value.strip()
+    )
+
+
+def _excel_row_width(values: list[Any]) -> int:
+    for index in range(len(values) - 1, -1, -1):
+        if not _excel_value_is_empty(values[index]):
+            return index + 1
+    return 0
+
+
+def _safe_excel_identifier(
+    raw_name: Any,
+    fallback: str,
+    used_names: set[str],
+    *,
+    max_length: int = 120,
+) -> str:
+    """Normalize an Excel label into a readable, unique SQLite name."""
+    name = str(raw_name or "").replace("\x00", " ").strip()
+    name = re.sub(r"\s+", "_", name)
+    name = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", name)
+    name = name.strip("._-")[:max_length] or fallback
+    if name.lower().startswith(("sqlite_", "_chatbi_")):
+        name = f"excel_{name}"
+
+    candidate = name
+    suffix = 2
+    while candidate.casefold() in used_names:
+        suffix_text = f"_{suffix}"
+        candidate = f"{name[:max_length - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+    used_names.add(candidate.casefold())
+    return candidate
+
+
+def _excel_value_type(value: Any) -> str | None:
+    if _excel_value_is_empty(value):
+        return None
+    if isinstance(value, bool):
+        return "INTEGER"
+    if isinstance(value, int):
+        return "INTEGER"
+    if isinstance(value, (float, Decimal)):
+        return "REAL"
+    if isinstance(value, bytes):
+        return "BLOB"
+    return "TEXT"
+
+
+def _merge_excel_types(current: str | None, incoming: str | None) -> str | None:
+    if incoming is None:
+        return current
+    if current is None or current == incoming:
+        return incoming
+    if {current, incoming} <= {"INTEGER", "REAL"}:
+        return "REAL"
+    return "TEXT"
+
+
+def _excel_sqlite_value(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Decimal) and not value.is_finite():
+        return None
+    return _sqlite_value(value)
+
+
+def _validate_excel_upload(original_name: str, content: bytes) -> None:
+    suffix = Path(Path(original_name).name).suffix.lower()
+    if suffix not in ALLOWED_EXCEL_EXTENSIONS:
+        raise DataSourceError("只支持 .xlsx 和 .xlsm Excel 文件。")
+    if not content:
+        raise DataSourceError("上传的 Excel 文件为空。")
+    if len(content) > MAX_EXCEL_SIZE_BYTES:
+        raise DataSourceError("Excel 文件不能超过 20 MB。")
+
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            if not {"[Content_Types].xml", "xl/workbook.xml"} <= names:
+                raise DataSourceError("文件不是有效的 Excel 工作簿。")
+            expanded_size = sum(item.file_size for item in archive.infolist())
+            if expanded_size > MAX_EXCEL_EXPANDED_SIZE_BYTES:
+                raise DataSourceError("Excel 解压后的内容不能超过 200 MB。")
+    except BadZipFile as error:
+        raise DataSourceError("文件不是有效的 Excel 工作簿。") from error
+
+
+def _scan_excel_workbook(content: bytes) -> list[_ExcelSheetSpec]:
+    """Inspect sheets, infer a SQLite schema, and enforce import limits."""
+    try:
+        workbook = load_workbook(
+            BytesIO(content),
+            read_only=True,
+            data_only=True,
+            keep_links=False,
+        )
+    except Exception as error:
+        raise DataSourceError(f"无法读取 Excel 工作簿：{error}") from error
+
+    try:
+        if len(workbook.worksheets) > MAX_EXCEL_SHEETS:
+            raise DataSourceError(
+                f"Excel 工作簿最多支持 {MAX_EXCEL_SHEETS} 个工作表。"
+            )
+
+        specs: list[_ExcelSheetSpec] = []
+        used_table_names: set[str] = set()
+        total_rows = 0
+        for sheet_index, worksheet in enumerate(workbook.worksheets, start=1):
+            if (worksheet.max_column or 0) > MAX_EXCEL_COLUMNS:
+                raise DataSourceError(
+                    f"工作表“{worksheet.title}”超过 "
+                    f"{MAX_EXCEL_COLUMNS} 列限制。"
+                )
+            if (worksheet.max_row or 0) > MAX_EXCEL_ROWS + 1:
+                raise DataSourceError(
+                    f"工作表“{worksheet.title}”超过 "
+                    f"{MAX_EXCEL_ROWS:,} 行限制。"
+                )
+            header_values: list[Any] | None = None
+            header_row_number = 0
+            inferred_types: list[str | None] = []
+            row_count = 0
+
+            for row_number, raw_row in enumerate(
+                worksheet.iter_rows(values_only=True),
+                start=1,
+            ):
+                values = list(raw_row)
+                width = _excel_row_width(values)
+                if width == 0:
+                    continue
+                if width > MAX_EXCEL_COLUMNS:
+                    raise DataSourceError(
+                        f"工作表“{worksheet.title}”超过 "
+                        f"{MAX_EXCEL_COLUMNS} 列限制。"
+                    )
+
+                if header_values is None:
+                    header_values = values[:width]
+                    inferred_types = [None] * width
+                    header_row_number = row_number
+                    continue
+
+                if width > len(header_values):
+                    extension = width - len(header_values)
+                    header_values.extend([None] * extension)
+                    inferred_types.extend([None] * extension)
+
+                row_count += 1
+                total_rows += 1
+                if total_rows > MAX_EXCEL_ROWS:
+                    raise DataSourceError(
+                        f"Excel 数据总行数不能超过 {MAX_EXCEL_ROWS:,} 行。"
+                    )
+                for column_index, value in enumerate(values[:width]):
+                    inferred_types[column_index] = _merge_excel_types(
+                        inferred_types[column_index],
+                        _excel_value_type(value),
+                    )
+
+            if header_values is None:
+                continue
+
+            used_column_names: set[str] = set()
+            columns: list[dict[str, str]] = []
+            for column_index, raw_header in enumerate(header_values, start=1):
+                column_name = _safe_excel_identifier(
+                    raw_header,
+                    f"column_{column_index}",
+                    used_column_names,
+                )
+                original_header = str(raw_header or "").strip()[:200]
+                description = (
+                    f"Excel 原始列：{original_header}"
+                    if original_header
+                    else f"Excel 第 {column_index} 列"
+                )
+                columns.append(
+                    {
+                        "name": column_name,
+                        "source_type": (
+                            inferred_types[column_index - 1] or "TEXT"
+                        ),
+                        "comment": description,
+                    }
+                )
+
+            table_name = _safe_excel_identifier(
+                worksheet.title,
+                f"sheet_{sheet_index}",
+                used_table_names,
+                max_length=60,
+            )
+            specs.append(
+                _ExcelSheetSpec(
+                    sheet_name=worksheet.title,
+                    table_name=table_name,
+                    header_row_number=header_row_number,
+                    columns=tuple(columns),
+                    row_count=row_count,
+                )
+            )
+    finally:
+        workbook.close()
+
+    if not specs:
+        raise DataSourceError("Excel 工作簿中没有可导入的数据表。")
+    return specs
+
+
+def _safe_excel_snapshot_path(original_name: str, content: bytes) -> Path:
+    source_name = Path(original_name).name
+    safe_stem = re.sub(
+        r"[^\w\u4e00-\u9fff-]+",
+        "_",
+        Path(source_name).stem,
+    ).strip("._-")[:60] or "excel"
+    digest = sha256(content).hexdigest()[:10]
+    unique_suffix = uuid4().hex[:8]
+    return (
+        UPLOAD_DIRECTORY
+        / f"excel_{safe_stem}-{digest}-{unique_suffix}.db"
+    ).resolve()
+
+
+def stage_excel_workbook(
+    original_name: str,
+    content: bytes,
+) -> StagedDatabaseSnapshot:
+    """Convert an Excel workbook into a private, query-ready SQLite snapshot."""
+    _validate_excel_upload(original_name, content)
+    specs = _scan_excel_workbook(content)
+    ensure_private_upload_directory()
+
+    target_path = _safe_excel_snapshot_path(original_name, content)
+    if target_path.parent != UPLOAD_DIRECTORY.resolve():
+        raise DataSourceError("Excel 文件名无效。")
+    staged_path = (
+        UPLOAD_DIRECTORY
+        / f".{target_path.name}.{uuid4().hex}.staged"
+    )
+    display_name = Path(Path(original_name).name).stem.strip()[:200] or "Excel 数据"
+    completed = False
+
+    try:
+        _create_private_file(staged_path)
+        with sqlite3.connect(staged_path) as local:
+            local.execute("PRAGMA foreign_keys = OFF")
+            _initialize_snapshot_metadata(local, "Excel", display_name)
+            local.executemany(
+                "INSERT INTO _chatbi_source_metadata (key, value) VALUES (?, ?)",
+                (
+                    ("source_file_name", Path(original_name).name),
+                    ("sheet_count", str(len(specs))),
+                    ("row_count", str(sum(spec.row_count for spec in specs))),
+                    (
+                        "sheet_mapping",
+                        json.dumps(
+                            {
+                                spec.sheet_name: spec.table_name
+                                for spec in specs
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                ),
+            )
+
+            try:
+                workbook = load_workbook(
+                    BytesIO(content),
+                    read_only=True,
+                    data_only=True,
+                    keep_links=False,
+                )
+            except Exception as error:
+                raise DataSourceError(
+                    f"无法再次读取 Excel 工作簿：{error}"
+                ) from error
+
+            try:
+                worksheet_by_name = {
+                    worksheet.title: worksheet
+                    for worksheet in workbook.worksheets
+                }
+                for spec in specs:
+                    insert_sql = _create_snapshot_table(
+                        local,
+                        spec.table_name,
+                        list(spec.columns),
+                    )
+                    worksheet = worksheet_by_name[spec.sheet_name]
+                    batch: list[tuple[Any, ...]] = []
+                    for row_number, raw_row in enumerate(
+                        worksheet.iter_rows(values_only=True),
+                        start=1,
+                    ):
+                        if row_number <= spec.header_row_number:
+                            continue
+                        values = list(raw_row[:len(spec.columns)])
+                        if not any(
+                            not _excel_value_is_empty(value)
+                            for value in values
+                        ):
+                            continue
+                        values.extend([None] * (len(spec.columns) - len(values)))
+                        batch.append(
+                            tuple(_excel_sqlite_value(value) for value in values)
+                        )
+                        if len(batch) >= 1000:
+                            local.executemany(insert_sql, batch)
+                            local.commit()
+                            batch.clear()
+                            _check_snapshot_size(staged_path)
+                    if batch:
+                        local.executemany(insert_sql, batch)
+                    local.commit()
+                    _check_snapshot_size(staged_path)
+            finally:
+                workbook.close()
+
+        inspect_sqlite_database(staged_path)
+        _harden_private_file(staged_path)
+        completed = True
+        return StagedDatabaseSnapshot(
+            staged_path=staged_path.resolve(),
+            target_path=target_path,
+            display_name=display_name,
+        )
+    except DataSourceError:
+        raise
+    except Exception as error:
+        raise DataSourceError(f"Excel 数据导入失败：{error}") from error
+    finally:
+        if not completed:
+            staged_path.unlink(missing_ok=True)
 
 
 def _validate_remote_connection(
