@@ -5,7 +5,9 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -23,6 +25,7 @@ for _chain_variable in (
 
 import dashboard_ui
 from application.dashboard_service import default_dashboard_layout
+from infrastructure.data_sources import RemoteSyncResult
 
 
 class DashboardUiTestCase(unittest.TestCase):
@@ -73,6 +76,96 @@ class DashboardUiTestCase(unittest.TestCase):
             session_state[dashboard_ui._draft_key(user.id)],
             layout,
         )
+
+    def test_dashboard_syncs_each_remote_source_before_querying(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "snapshot.db"
+            database_path.write_bytes(b"snapshot")
+            credentials = dashboard_ui.RemoteDatabaseCredentials(
+                database_type="MySQL",
+                host="10.0.0.8",
+                port=3306,
+                user="reader",
+                password="secret",
+                database="sales",
+            )
+            user = SimpleNamespace(id=39, session_version=1)
+            query = SimpleNamespace(
+                id=7,
+                datasource_id=4,
+                title="销售趋势",
+                datasource_name="销售库",
+                sql_query="SELECT 1 AS value",
+                visualization_spec={"chart_type": "none"},
+            )
+            source = SimpleNamespace(
+                id=4,
+                version=1,
+                display_name="销售库",
+                path=database_path,
+            )
+            service = Mock()
+            service.queries_by_id.return_value = {7: query}
+            auth_service = Mock()
+            auth_service.resolve_authorized_datasource.return_value = source
+            session_state = {"remote_sync_credentials": {4: credentials}}
+            sync_result = RemoteSyncResult(
+                attempted=True,
+                changed=True,
+                rows_synced=2,
+                data_version=2,
+                synced_at="2026-08-04T10:05:00",
+                message="已同步 2 条变更记录。",
+            )
+
+            with (
+                patch.object(dashboard_ui.st, "session_state", session_state),
+                patch.object(
+                    dashboard_ui,
+                    "snapshot_sync_status",
+                    side_effect=[
+                        {
+                            "remote": True,
+                            "enabled": True,
+                            "data_version": 1,
+                        },
+                        {
+                            "remote": True,
+                            "enabled": True,
+                            "data_version": 2,
+                        },
+                    ],
+                ),
+                patch.object(
+                    dashboard_ui,
+                    "sync_remote_database_snapshot",
+                    return_value=sync_result,
+                ) as sync,
+                patch.object(
+                    dashboard_ui,
+                    "_execute_dashboard_query",
+                    return_value=([{"value": 1}], None, "10:05:01"),
+                ) as execute,
+            ):
+                payload, refresh_times, summary = (
+                    dashboard_ui._query_payload(
+                        service,
+                        auth_service,
+                        user,
+                        {"id": "slot", "kind": "slot", "widget_id": 7},
+                    )
+                )
+
+        sync.assert_called_once_with(
+            database_path,
+            credentials,
+            minimum_interval_seconds=dashboard_ui.REFRESH_SECONDS,
+        )
+        self.assertEqual(execute.call_args.args[4], 2)
+        self.assertEqual(payload["7"]["rows"], [{"value": 1}])
+        self.assertEqual(refresh_times, ["10:05:01"])
+        self.assertEqual(summary["status"], "ok")
+        self.assertIn("10:05:00", summary["message"])
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from copy import deepcopy
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +26,25 @@ from auth.constants import QUERY_DATA
 from auth.models import AuthError, User, ValidationError
 from auth.service import AuthService
 from dashboard_component import dashboard_canvas
+from infrastructure.data_sources import (
+    DataSourceError,
+    RemoteDatabaseCredentials,
+    snapshot_sync_status,
+    sync_remote_database_snapshot,
+)
 from infrastructure.db_manager import DatabaseManager
 
 
-REFRESH_SECONDS = 300
-CACHE_TTL_SECONDS = 290
+def _refresh_seconds() -> int:
+    try:
+        configured = int(os.getenv("DASHBOARD_REFRESH_SECONDS", "300"))
+    except ValueError:
+        configured = 300
+    return min(max(configured, 30), 3600)
+
+
+REFRESH_SECONDS = _refresh_seconds()
+CACHE_TTL_SECONDS = max(1, REFRESH_SECONDS - 10)
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
@@ -38,10 +53,16 @@ def _execute_dashboard_query(
     datasource_version: int,
     database_path: str,
     database_modified_at: int,
+    data_version: int,
     sql_query: str,
 ) -> tuple[list[dict[str, Any]], str | None, str]:
     """Execute a saved read-only query at most once per five-minute window."""
-    del datasource_id, datasource_version, database_modified_at
+    del (
+        datasource_id,
+        datasource_version,
+        database_modified_at,
+        data_version,
+    )
     manager = DatabaseManager(Path(database_path))
     rows, error = manager.execute_query(sql_query)
     return rows, error, datetime.now().strftime("%H:%M:%S")
@@ -93,7 +114,7 @@ def _query_payload(
     auth_service: AuthService,
     current_user: User,
     layout: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], list[str]]:
+) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, str]]:
     def json_safe_rows(
         rows: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
@@ -123,6 +144,98 @@ def _query_payload(
         current_user.session_version,
         widget_ids,
     )
+    datasource_ids = {
+        query.datasource_id for query in widgets.values()
+    }
+    resolved_sources: dict[int, Any] = {}
+    source_errors: dict[int, str] = {}
+    source_sync_statuses: dict[int, dict[str, Any]] = {}
+    sync_warnings: list[str] = []
+    sync_successes: list[str] = []
+    raw_credentials = st.session_state.get(
+        "remote_sync_credentials",
+        {},
+    )
+    credentials_by_id = (
+        raw_credentials if isinstance(raw_credentials, dict) else {}
+    )
+
+    for datasource_id in sorted(datasource_ids):
+        try:
+            datasource = auth_service.resolve_authorized_datasource(
+                current_user.id,
+                datasource_id,
+                QUERY_DATA,
+            )
+            resolved_sources[datasource_id] = datasource
+        except (AuthError, OSError) as error:
+            source_errors[datasource_id] = str(error)
+            sync_warnings.append(str(error))
+            continue
+
+        try:
+            status = snapshot_sync_status(datasource.path)
+            if status.get("remote"):
+                credentials = credentials_by_id.get(
+                    datasource_id,
+                    credentials_by_id.get(str(datasource_id)),
+                )
+                if (
+                    status.get("enabled")
+                    and isinstance(credentials, RemoteDatabaseCredentials)
+                ):
+                    result = sync_remote_database_snapshot(
+                        datasource.path,
+                        credentials,
+                        minimum_interval_seconds=REFRESH_SECONDS,
+                    )
+                    if result.attempted:
+                        sync_successes.append(result.synced_at)
+                        try:
+                            auth_service.record_audit(
+                                actor_user_id=current_user.id,
+                                action="sync_datasource",
+                                outcome="success",
+                                target_type="datasource",
+                                target_id=datasource.id,
+                                datasource_id=datasource.id,
+                                details={
+                                    "rows_synced": result.rows_synced,
+                                    "data_version": result.data_version,
+                                },
+                            )
+                        except AuthError:
+                            pass
+                elif status.get("enabled"):
+                    sync_warnings.append(
+                        f"“{datasource.display_name}”缺少当前会话凭据，"
+                        "正在显示最近成功快照。"
+                    )
+                else:
+                    sync_warnings.append(
+                        f"“{datasource.display_name}”是旧版远程快照，"
+                        "重新添加后才能自动同步。"
+                    )
+                status = snapshot_sync_status(datasource.path)
+            source_sync_statuses[datasource_id] = status
+        except (DataSourceError, OSError) as error:
+            source_sync_statuses[datasource_id] = snapshot_sync_status(
+                datasource.path
+            )
+            sync_warnings.append(str(error))
+            try:
+                auth_service.record_audit(
+                    actor_user_id=current_user.id,
+                    action="sync_datasource",
+                    outcome="failure",
+                    target_type="datasource",
+                    target_id=datasource.id,
+                    datasource_id=datasource.id,
+                    details={"error_type": error.__class__.__name__},
+                )
+            except AuthError:
+                pass
+
     payload: dict[str, dict[str, Any]] = {}
     refresh_times: list[str] = []
     for widget_id in widget_ids:
@@ -137,24 +250,27 @@ def _query_payload(
             }
             continue
         try:
-            datasource = auth_service.resolve_authorized_datasource(
-                current_user.id,
-                query.datasource_id,
-                QUERY_DATA,
-            )
+            if query.datasource_id in source_errors:
+                raise AuthError(source_errors[query.datasource_id])
+            datasource = resolved_sources[query.datasource_id]
             modified_at = (
                 datasource.path.stat().st_mtime_ns
                 if datasource.path.is_file()
                 else 0
+            )
+            sync_status = source_sync_statuses.get(
+                query.datasource_id,
+                {},
             )
             rows, error, refreshed_at = _execute_dashboard_query(
                 datasource.id,
                 datasource.version,
                 str(datasource.path),
                 modified_at,
+                int(sync_status.get("data_version", 0) or 0),
                 query.sql_query,
             )
-        except (AuthError, OSError) as error:
+        except (AuthError, KeyError, OSError) as error:
             rows = []
             error = str(error)
             refreshed_at = datetime.now().strftime("%H:%M:%S")
@@ -167,7 +283,20 @@ def _query_payload(
             "error": error or "",
             "refreshed_at": refreshed_at,
         }
-    return payload, refresh_times
+    sync_summary = {
+        "status": "warning" if sync_warnings else "ok",
+        "message": (
+            sync_warnings[0]
+            if sync_warnings
+            else (
+                "远程数据已同步至 "
+                + max(sync_successes).replace("T", " ")[-8:]
+                if sync_successes
+                else ""
+            )
+        ),
+    }
+    return payload, refresh_times, sync_summary
 
 
 @st.dialog("选择保存的查询图表", width="large")
@@ -376,7 +505,7 @@ def _render_dashboard_fragment(
     )
     if not isinstance(layout, dict):
         layout = dashboard.layout
-    widgets, refresh_times = _query_payload(
+    widgets, refresh_times, sync_summary = _query_payload(
         service,
         auth_service,
         current_user,
@@ -392,6 +521,9 @@ def _render_dashboard_fragment(
             if refresh_times
             else datetime.now().strftime("%H:%M:%S")
         ),
+        "refresh_seconds": REFRESH_SECONDS,
+        "sync_status": sync_summary["status"],
+        "sync_message": sync_summary["message"],
         "dirty": bool(
             st.session_state.get(_dirty_key(current_user.id), False)
         ),

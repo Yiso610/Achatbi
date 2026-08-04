@@ -77,6 +77,10 @@
       background: #24a36a;
       box-shadow: 0 0 0 4px rgba(36, 163, 106, .10);
     }
+    .status-dot.warning {
+      background: #d98b20;
+      box-shadow: 0 0 0 4px rgba(217, 139, 32, .12);
+    }
     .toolbar { display: flex; align-items: center; gap: 8px; }
     .tool-button {
       height: 32px;
@@ -710,13 +714,18 @@
 
       const topbar = document.createElement("div");
       topbar.className = "topbar";
-      const statusText = currentPayload.refresh_time
-        ? `数据更新于 ${escapeHtml(currentPayload.refresh_time)}`
-        : "等待数据刷新";
+      const statusText = currentPayload.sync_message || (currentPayload.refresh_time
+        ? `数据更新于 ${currentPayload.refresh_time}`
+        : "等待数据刷新");
+      const refreshSeconds = Math.max(30, Number(currentPayload.refresh_seconds || 300));
+      const refreshLabel = refreshSeconds % 60 === 0
+        ? `每 ${refreshSeconds / 60} 分钟自动刷新`
+        : `每 ${refreshSeconds} 秒自动刷新`;
+      const statusClass = currentPayload.sync_status === "warning" ? " warning" : "";
       topbar.innerHTML = `
         <div class="title-wrap">
           <h1 class="title">${escapeHtml(currentPayload.title || "可视化数据大屏")}</h1>
-          <div class="status"><span class="status-dot"></span><span>${statusText}</span><span class="secondary">· 每 5 分钟自动刷新</span></div>
+          <div class="status"><span class="status-dot${statusClass}"></span><span>${escapeHtml(statusText)}</span><span class="secondary">· ${escapeHtml(refreshLabel)}</span></div>
         </div>
         <div class="toolbar">
           ${editMode ? `<span class="editing-note">${currentPayload.dirty ? "有未保存修改" : "正在编辑"}</span><button class="tool-button" data-action="cancel">退出编辑</button><button class="tool-button" data-action="undo" title="撤回上一步布局操作"${currentPayload.can_undo ? "" : " disabled"}>撤回</button><button class="tool-button primary" data-action="save">保存</button>` : '<button class="tool-button" data-action="fullscreen">全屏</button><button class="tool-button primary" data-action="edit">编辑</button>'}
@@ -740,6 +749,11 @@
       if (currentPayload.layout) dashboard.appendChild(createNode(currentPayload.layout));
       else dashboard.innerHTML = '<div class="empty-data">大屏布局加载失败</div>';
       app.appendChild(dashboard);
+      if (refreshTimer) window.clearInterval(refreshTimer);
+      refreshTimer = window.setInterval(
+        () => emit("refresh"),
+        refreshSeconds * 1000
+      );
       setHeight();
     }
 
@@ -808,10 +822,6 @@
     });
 
     window.ChatBIStreamlit.setComponentReady();
-    refreshTimer = window.setInterval(
-      () => emit("refresh"),
-      300000
-    );
     setHeight();
   </script>
 </body>

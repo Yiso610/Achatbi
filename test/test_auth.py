@@ -20,7 +20,7 @@ from auth.constants import (
     ROLE_DATA_MANAGER,
     ROLE_VIEWER,
 )
-from auth.database import MetaDatabase
+from auth.database import CURRENT_SCHEMA_VERSION, MetaDatabase
 from auth.models import (
     AuthenticationError,
     AuthorizationError,
@@ -169,7 +169,7 @@ class AuthServiceTestCase(unittest.TestCase):
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
         self.assertEqual(str(row["source_key"]), "legacy.db")
-        self.assertEqual(int(latest), 4)
+        self.assertEqual(int(latest), CURRENT_SCHEMA_VERSION)
 
     def test_pending_field_review_lifecycle_and_access_isolation(self) -> None:
         source_key = "mysql_events-a1b2c3.db"

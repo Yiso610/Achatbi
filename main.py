@@ -772,7 +772,8 @@ def _render_remote_database_import(
     )
     st.caption(
         f"端口可省略，默认使用 {default_port}；"
-        "密码只保留在当前登录会话中。"
+        "密码只保留在当前登录会话中，"
+        "用于大屏每五分钟自动同步。"
     )
 
     remote_host, remote_port_number = _parse_server_address(
@@ -939,6 +940,19 @@ def _render_remote_database_import(
                         current_user.session_version,
                         source_key=preflight.source_key,
                     )
+                    if staged_snapshot.remote_credentials is not None:
+                        sync_credentials = dict(
+                            st.session_state.get(
+                                "remote_sync_credentials",
+                                {},
+                            )
+                        )
+                        sync_credentials[registered.id] = (
+                            staged_snapshot.remote_credentials
+                        )
+                        st.session_state.remote_sync_credentials = (
+                            sync_credentials
+                        )
                     st.session_state.active_datasource_id = registered.id
                     _clear_query_state()
                     st.session_state.pop("remote_database_catalog", None)

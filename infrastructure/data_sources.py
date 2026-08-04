@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
 from hashlib import sha256
@@ -11,9 +11,12 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import sqlite3
 import unicodedata
+import threading
+import time as time_module
 from typing import Any, Mapping
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
@@ -45,6 +48,19 @@ MYSQL_SYSTEM_DATABASES = {
     "performance_schema",
     "sys",
 }
+REMOTE_SYNC_CURSOR_NAMES = (
+    "updated_at",
+    "update_time",
+    "updated_time",
+    "modified_at",
+    "modified_time",
+    "last_modified",
+    "last_updated",
+    "更新时间",
+    "修改时间",
+)
+_REMOTE_SYNC_LOCKS: dict[str, threading.Lock] = {}
+_REMOTE_SYNC_LOCKS_GUARD = threading.Lock()
 
 
 class DataSourceError(ValueError):
@@ -52,10 +68,35 @@ class DataSourceError(ValueError):
 
 
 @dataclass(frozen=True)
+class RemoteDatabaseCredentials:
+    """Session-scoped credentials used to refresh one remote snapshot."""
+
+    database_type: str
+    host: str
+    port: int
+    user: str
+    password: str = field(repr=False, compare=False)
+    database: str
+
+
+@dataclass(frozen=True)
 class StagedDatabaseSnapshot:
     staged_path: Path
     target_path: Path
     display_name: str
+    remote_credentials: RemoteDatabaseCredentials | None = None
+
+
+@dataclass(frozen=True)
+class RemoteSyncResult:
+    """Outcome of one due-check or remote snapshot synchronization."""
+
+    attempted: bool
+    changed: bool
+    rows_synced: int
+    data_version: int
+    synced_at: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -812,6 +853,36 @@ def _validate_remote_connection(
     return normalized_type, normalized_host, int(port), normalized_user
 
 
+def create_remote_database_credentials(
+    database_type: str,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: str,
+) -> RemoteDatabaseCredentials:
+    """Validate one remote target and return a non-persistent credential."""
+    provider, normalized_host, normalized_port, normalized_user = (
+        _validate_remote_connection(
+            database_type,
+            host,
+            port,
+            user,
+        )
+    )
+    normalized_database = str(database or "").strip()
+    if not normalized_database:
+        raise DataSourceError("请选择需要添加的数据库。")
+    return RemoteDatabaseCredentials(
+        database_type=provider,
+        host=normalized_host,
+        port=normalized_port,
+        user=normalized_user,
+        password=str(password or ""),
+        database=normalized_database,
+    )
+
+
 def _remote_host_is_allowed(host: str, port: int) -> bool:
     """Apply the deployment-controlled outbound host-and-port allowlist."""
     raw_allowlist = os.getenv(
@@ -1333,6 +1404,7 @@ def _initialize_snapshot_metadata(
     local: sqlite3.Connection,
     database_type: str,
     database: str,
+    remote_credentials: RemoteDatabaseCredentials | None = None,
 ) -> None:
     """Create internal metadata tables excluded from ChatBI queries."""
     local.execute(
@@ -1353,30 +1425,77 @@ def _initialize_snapshot_metadata(
         )
         """
     )
+    now = datetime.now().isoformat(timespec="seconds")
+    metadata = [
+        ("display_name", database),
+        ("database_type", database_type),
+        ("database_name", database),
+        ("snapshot_created_at", now),
+    ]
+    if remote_credentials is not None:
+        metadata.extend(
+            (
+                ("source_host", remote_credentials.host),
+                ("source_port", str(remote_credentials.port)),
+                ("source_user", remote_credentials.user),
+                ("sync_enabled", "1"),
+                ("sync_interval_seconds", "300"),
+                ("last_sync_epoch", str(time_module.time())),
+                ("snapshot_updated_at", now),
+                ("data_version", "1"),
+            )
+        )
     local.executemany(
         "INSERT INTO _chatbi_source_metadata (key, value) VALUES (?, ?)",
-        (
-            ("display_name", database),
-            ("database_type", database_type),
-            ("database_name", database),
-            ("snapshot_created_at", datetime.now().isoformat(timespec="seconds")),
-        ),
+        metadata,
+    )
+
+
+def _initialize_remote_sync_schema(local: sqlite3.Connection) -> None:
+    local.execute(
+        """
+        CREATE TABLE _chatbi_sync_state (
+            local_table_name TEXT PRIMARY KEY,
+            source_schema TEXT NOT NULL,
+            source_table_name TEXT NOT NULL,
+            sync_mode TEXT NOT NULL
+                CHECK (sync_mode IN ('updated', 'append', 'full')),
+            primary_key_column TEXT NOT NULL DEFAULT '',
+            cursor_column TEXT NOT NULL DEFAULT '',
+            last_cursor_json TEXT NOT NULL DEFAULT '',
+            last_primary_key_json TEXT NOT NULL DEFAULT '',
+            last_synced_at TEXT NOT NULL,
+            rows_synced INTEGER NOT NULL DEFAULT 0
+        )
+        """
     )
 
 
 def _create_snapshot_table(
     local: sqlite3.Connection,
     local_table_name: str,
-    columns: list[dict[str, str]],
+    columns: list[dict[str, Any]],
     *,
     field_descriptions: Mapping[tuple[str, str], str] | None = None,
 ) -> str:
     """Create one SQLite table and return its parameterized insert SQL."""
-    column_definitions = ", ".join(
+    definitions = [
         f"{quote_identifier(column['name'])} "
         f"{_sqlite_type(column['source_type'])}"
         for column in columns
-    )
+    ]
+    primary_keys = [
+        str(column["name"])
+        for column in columns
+        if bool(column.get("primary_key"))
+    ]
+    if primary_keys:
+        definitions.append(
+            "PRIMARY KEY ("
+            + ", ".join(quote_identifier(name) for name in primary_keys)
+            + ")"
+        )
+    column_definitions = ", ".join(definitions)
     local.execute(
         f"CREATE TABLE {quote_identifier(local_table_name)} "
         f"({column_definitions})"
@@ -1445,7 +1564,9 @@ def _mysql_table_specs(connection, database: str) -> list[dict[str, Any]]:
                     column_name,
                     data_type,
                     column_type,
-                    COALESCE(column_comment, '')
+                    COALESCE(column_comment, ''),
+                    column_key,
+                    extra
                 FROM information_schema.columns
                 WHERE table_schema = %s
                   AND table_name = %s
@@ -1458,6 +1579,10 @@ def _mysql_table_specs(connection, database: str) -> list[dict[str, Any]]:
                     "name": str(row[0]),
                     "source_type": str(row[2] or row[1]),
                     "comment": str(row[3] or ""),
+                    "primary_key": str(row[4] or "").upper() == "PRI",
+                    "auto_increment": "auto_increment" in str(
+                        row[5] or ""
+                    ).lower(),
                 }
                 for row in cursor.fetchall()
             ]
@@ -1494,6 +1619,22 @@ def _postgresql_table_specs(connection) -> list[dict[str, Any]]:
         for schema_name, table_name in tables:
             cursor.execute(
                 """
+                SELECT kcu.column_name
+                FROM information_schema.table_constraints AS tc
+                JOIN information_schema.key_column_usage AS kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                 AND tc.table_schema = kcu.table_schema
+                 AND tc.table_name = kcu.table_name
+                WHERE tc.constraint_type = 'PRIMARY KEY'
+                  AND tc.table_schema = %s
+                  AND tc.table_name = %s
+                ORDER BY kcu.ordinal_position
+                """,
+                (schema_name, table_name),
+            )
+            primary_keys = {str(row[0]) for row in cursor.fetchall()}
+            cursor.execute(
+                """
                 SELECT
                     columns.column_name,
                     columns.data_type,
@@ -1504,7 +1645,9 @@ def _postgresql_table_specs(connection) -> list[dict[str, Any]]:
                             columns.ordinal_position
                         ),
                         ''
-                    )
+                    ),
+                    columns.is_identity,
+                    columns.column_default
                 FROM information_schema.columns AS columns
                 LEFT JOIN pg_catalog.pg_namespace AS namespace
                   ON namespace.nspname = columns.table_schema
@@ -1522,6 +1665,11 @@ def _postgresql_table_specs(connection) -> list[dict[str, Any]]:
                     "name": str(row[0]),
                     "source_type": str(row[2] or row[1]),
                     "comment": str(row[3] or ""),
+                    "primary_key": str(row[0]) in primary_keys,
+                    "auto_increment": (
+                        str(row[4] or "").upper() == "YES"
+                        or "nextval(" in str(row[5] or "").lower()
+                    ),
                 }
                 for row in cursor.fetchall()
             ]
@@ -1620,6 +1768,130 @@ def preflight_remote_database(
     )
 
 
+def _remote_table_identifier(
+    provider: str,
+    schema_name: str,
+    table_name: str,
+) -> str:
+    if provider == "MySQL":
+        quoted_schema = "`" + schema_name.replace("`", "``") + "`"
+        quoted_table = "`" + table_name.replace("`", "``") + "`"
+        return f"{quoted_schema}.{quoted_table}"
+    return (
+        f"{quote_identifier(schema_name)}."
+        f"{quote_identifier(table_name)}"
+    )
+
+
+def _remote_sync_strategy(
+    columns: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    primary_keys = [
+        column
+        for column in columns
+        if bool(column.get("primary_key"))
+    ]
+    if len(primary_keys) != 1:
+        return "full", "", ""
+
+    primary_key = str(primary_keys[0]["name"])
+    by_name = {
+        str(column["name"]).casefold(): column
+        for column in columns
+    }
+    for candidate in REMOTE_SYNC_CURSOR_NAMES:
+        column = by_name.get(candidate.casefold())
+        if column is None:
+            continue
+        source_type = str(column.get("source_type", "")).lower()
+        if any(token in source_type for token in ("date", "time")):
+            return "updated", primary_key, str(column["name"])
+
+    if bool(primary_keys[0].get("auto_increment")):
+        return "append", primary_key, primary_key
+    return "full", primary_key, ""
+
+
+def _cursor_sort_value(value: Any) -> tuple[int, Any]:
+    if value is None:
+        return (0, "")
+    if isinstance(value, datetime):
+        return (1, value.isoformat(sep=" "))
+    if isinstance(value, (date, time)):
+        return (1, value.isoformat())
+    if isinstance(value, Decimal):
+        return (1, float(value))
+    if isinstance(value, (int, float, str)):
+        return (1, value)
+    return (1, str(value))
+
+
+def _cursor_json(value: Any) -> str:
+    if value is None:
+        return ""
+    return json.dumps(
+        _sqlite_value(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _cursor_from_json(value: str) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as error:
+        raise DataSourceError("数据源增量同步游标已损坏。") from error
+
+
+def _snapshot_metadata(database_path: Path) -> dict[str, str]:
+    try:
+        with sqlite3.connect(
+            f"{database_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+        ) as connection:
+            return {
+                str(row[0]): str(row[1])
+                for row in connection.execute(
+                    "SELECT key, value FROM _chatbi_source_metadata"
+                ).fetchall()
+            }
+    except sqlite3.Error as error:
+        raise DataSourceError("无法读取数据源同步状态。") from error
+
+
+def snapshot_sync_status(database_path: Path | str) -> dict[str, Any]:
+    """Return non-secret synchronization metadata for dashboard display."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        return {
+            "remote": False,
+            "enabled": False,
+            "data_version": 0,
+            "last_synced_at": "",
+        }
+    try:
+        metadata = _snapshot_metadata(path)
+    except DataSourceError:
+        return {
+            "remote": False,
+            "enabled": False,
+            "data_version": 0,
+            "last_synced_at": "",
+        }
+    provider = metadata.get("database_type", "")
+    return {
+        "remote": provider in REMOTE_DATABASE_TYPES,
+        "enabled": metadata.get("sync_enabled") == "1",
+        "data_version": int(metadata.get("data_version", "0") or 0),
+        "last_synced_at": metadata.get(
+            "snapshot_updated_at",
+            metadata.get("snapshot_created_at", ""),
+        ),
+    }
+
+
 def stage_remote_database(
     database_type: str,
     host: str,
@@ -1631,15 +1903,20 @@ def stage_remote_database(
     field_descriptions: Mapping[tuple[str, str], str] | None = None,
 ) -> StagedDatabaseSnapshot:
     """Build and validate a private snapshot without publishing it."""
-    provider, host, port, user = _validate_remote_connection(
+    credentials = create_remote_database_credentials(
         database_type,
         host,
         port,
         user,
+        password,
+        database,
     )
-    database = database.strip()
-    if not database:
-        raise DataSourceError("请选择需要添加的数据库。")
+    provider = credentials.database_type
+    host = credentials.host
+    port = credentials.port
+    user = credentials.user
+    password = credentials.password
+    database = credentials.database
 
     ensure_private_upload_directory()
     target_path = _safe_remote_snapshot_path(
@@ -1704,7 +1981,13 @@ def stage_remote_database(
 
         with sqlite3.connect(temporary_path) as local:
             local.execute("PRAGMA foreign_keys = OFF")
-            _initialize_snapshot_metadata(local, provider, database)
+            _initialize_snapshot_metadata(
+                local,
+                provider,
+                database,
+                credentials,
+            )
+            _initialize_remote_sync_schema(local)
 
             for table in table_specs:
                 insert_sql = _create_snapshot_table(
@@ -1713,17 +1996,32 @@ def stage_remote_database(
                     table["columns"],
                     field_descriptions=field_descriptions,
                 )
-
-                if provider == "MySQL":
-                    remote_table = (
-                        "`"
-                        + table["name"].replace("`", "``")
-                        + "`"
-                    )
-                else:
-                    remote_schema = quote_identifier(table["schema"])
-                    remote_name = quote_identifier(table["name"])
-                    remote_table = f"{remote_schema}.{remote_name}"
+                sync_mode, primary_key, cursor_column = (
+                    _remote_sync_strategy(table["columns"])
+                )
+                remote_table = _remote_table_identifier(
+                    provider,
+                    table["schema"],
+                    table["name"],
+                )
+                column_names = [
+                    str(column["name"])
+                    for column in table["columns"]
+                ]
+                primary_key_index = (
+                    column_names.index(primary_key)
+                    if primary_key
+                    else -1
+                )
+                cursor_index = (
+                    column_names.index(cursor_column)
+                    if cursor_column
+                    else -1
+                )
+                last_cursor = None
+                last_primary_key = None
+                last_sort_key = None
+                copied_rows = 0
 
                 with remote.cursor() as cursor:
                     cursor.execute(f"SELECT * FROM {remote_table}")
@@ -1738,8 +2036,59 @@ def stage_remote_database(
                                 for row in rows
                             ],
                         )
+                        copied_rows += len(rows)
+                        if sync_mode in {"updated", "append"}:
+                            for row in rows:
+                                cursor_value = row[cursor_index]
+                                primary_key_value = row[primary_key_index]
+                                if (
+                                    cursor_value is None
+                                    or primary_key_value is None
+                                ):
+                                    continue
+                                sort_key = (
+                                    _cursor_sort_value(cursor_value),
+                                    _cursor_sort_value(primary_key_value),
+                                )
+                                if (
+                                    last_sort_key is None
+                                    or sort_key > last_sort_key
+                                ):
+                                    last_sort_key = sort_key
+                                    last_cursor = cursor_value
+                                    last_primary_key = primary_key_value
                         local.commit()
                         _check_snapshot_size(temporary_path)
+
+                local.execute(
+                    """
+                    INSERT INTO _chatbi_sync_state (
+                        local_table_name,
+                        source_schema,
+                        source_table_name,
+                        sync_mode,
+                        primary_key_column,
+                        cursor_column,
+                        last_cursor_json,
+                        last_primary_key_json,
+                        last_synced_at,
+                        rows_synced
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        table["local_name"],
+                        table["schema"],
+                        table["name"],
+                        sync_mode,
+                        primary_key,
+                        cursor_column,
+                        _cursor_json(last_cursor),
+                        _cursor_json(last_primary_key),
+                        datetime.now().isoformat(timespec="seconds"),
+                        copied_rows,
+                    ),
+                )
 
             local.commit()
 
@@ -1750,6 +2099,7 @@ def stage_remote_database(
             staged_path=temporary_path.resolve(),
             target_path=target_path,
             display_name=database,
+            remote_credentials=credentials,
         )
     except DataSourceError:
         raise
@@ -1763,6 +2113,379 @@ def stage_remote_database(
             remote.close()
         if not completed:
             temporary_path.unlink(missing_ok=True)
+
+
+def _remote_column_identifier(provider: str, column_name: str) -> str:
+    if provider == "MySQL":
+        return "`" + column_name.replace("`", "``") + "`"
+    return quote_identifier(column_name)
+
+
+def _snapshot_upsert_sql(
+    table_name: str,
+    column_names: list[str],
+    primary_key: str,
+) -> str:
+    columns_sql = ", ".join(
+        quote_identifier(name) for name in column_names
+    )
+    placeholders = ", ".join("?" for _ in column_names)
+    assignments = [
+        f"{quote_identifier(name)} = excluded.{quote_identifier(name)}"
+        for name in column_names
+        if name != primary_key
+    ]
+    conflict_action = (
+        "DO UPDATE SET " + ", ".join(assignments)
+        if assignments
+        else "DO NOTHING"
+    )
+    return (
+        f"INSERT INTO {quote_identifier(table_name)} ({columns_sql}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT({quote_identifier(primary_key)}) {conflict_action}"
+    )
+
+
+def _remote_sync_lock(database_path: Path) -> threading.Lock:
+    key = str(database_path.resolve())
+    with _REMOTE_SYNC_LOCKS_GUARD:
+        return _REMOTE_SYNC_LOCKS.setdefault(key, threading.Lock())
+
+
+def _connect_remote_snapshot(
+    credentials: RemoteDatabaseCredentials,
+):
+    if credentials.database_type == "MySQL":
+        return _connect_mysql(
+            credentials.host,
+            credentials.port,
+            credentials.user,
+            credentials.password,
+            credentials.database,
+        )
+    return _connect_postgresql(
+        credentials.host,
+        credentials.port,
+        credentials.user,
+        credentials.password,
+        credentials.database,
+    )
+
+
+def _verify_sync_credentials(
+    metadata: dict[str, str],
+    credentials: RemoteDatabaseCredentials,
+) -> None:
+    expected = (
+        metadata.get("database_type", ""),
+        metadata.get("source_host", ""),
+        metadata.get("source_port", ""),
+        metadata.get("source_user", ""),
+        metadata.get("database_name", ""),
+    )
+    supplied = (
+        credentials.database_type,
+        credentials.host,
+        str(credentials.port),
+        credentials.user,
+        credentials.database,
+    )
+    if expected != supplied:
+        raise DataSourceError("当前会话的远程数据库凭据与快照不匹配。")
+
+
+def sync_remote_database_snapshot(
+    database_path: Path | str,
+    credentials: RemoteDatabaseCredentials,
+    *,
+    minimum_interval_seconds: int = 300,
+) -> RemoteSyncResult:
+    """Apply due remote changes to a private snapshot using an atomic copy."""
+    path = Path(database_path).expanduser().resolve()
+    upload_directory = ensure_private_upload_directory()
+    if path.parent != upload_directory or not path.is_file():
+        raise DataSourceError("待同步的数据库快照无效。")
+
+    interval = max(1, int(minimum_interval_seconds))
+    lock = _remote_sync_lock(path)
+    with lock:
+        metadata = _snapshot_metadata(path)
+        if metadata.get("sync_enabled") != "1":
+            raise DataSourceError(
+                "该快照没有增量同步信息，请重新添加远程数据库。"
+            )
+        _verify_sync_credentials(metadata, credentials)
+
+        now_epoch = time_module.time()
+        try:
+            last_sync_epoch = float(metadata.get("last_sync_epoch", "0"))
+        except ValueError:
+            last_sync_epoch = 0.0
+        current_version = int(metadata.get("data_version", "0") or 0)
+        last_synced_at = metadata.get(
+            "snapshot_updated_at",
+            metadata.get("snapshot_created_at", ""),
+        )
+        if now_epoch - last_sync_epoch < interval:
+            return RemoteSyncResult(
+                attempted=False,
+                changed=False,
+                rows_synced=0,
+                data_version=current_version,
+                synced_at=last_synced_at,
+                message="未到下一次五分钟同步时间。",
+            )
+
+        temporary_path = (
+            path.parent / f".{path.name}.{uuid4().hex}.syncing"
+        )
+        remote = None
+        published = False
+        try:
+            remote = _connect_remote_snapshot(credentials)
+            _create_private_file(temporary_path)
+            shutil.copyfile(path, temporary_path)
+            _harden_private_file(temporary_path)
+
+            rows_synced = 0
+            changed = False
+            synced_at = datetime.now().isoformat(timespec="seconds")
+            with sqlite3.connect(temporary_path) as local:
+                local.row_factory = sqlite3.Row
+                state_rows = local.execute(
+                    """
+                    SELECT *
+                    FROM _chatbi_sync_state
+                    ORDER BY local_table_name
+                    """
+                ).fetchall()
+                if not state_rows:
+                    raise DataSourceError(
+                        "数据源没有可用的增量同步表。"
+                    )
+
+                for state in state_rows:
+                    local_table = str(state["local_table_name"])
+                    source_schema = str(state["source_schema"])
+                    source_table = str(state["source_table_name"])
+                    sync_mode = str(state["sync_mode"])
+                    primary_key = str(state["primary_key_column"])
+                    cursor_column = str(state["cursor_column"])
+                    columns = [
+                        str(row["name"])
+                        for row in local.execute(
+                            f"PRAGMA table_info({quote_identifier(local_table)})"
+                        ).fetchall()
+                    ]
+                    if not columns:
+                        raise DataSourceError(
+                            f"本地快照表“{local_table}”不存在。"
+                        )
+
+                    remote_table = _remote_table_identifier(
+                        credentials.database_type,
+                        source_schema,
+                        source_table,
+                    )
+                    remote_columns = ", ".join(
+                        _remote_column_identifier(
+                            credentials.database_type,
+                            name,
+                        )
+                        for name in columns
+                    )
+                    parameters: tuple[Any, ...] = ()
+                    order_by = ""
+                    where_clause = ""
+                    last_cursor = _cursor_from_json(
+                        str(state["last_cursor_json"])
+                    )
+                    last_primary_key = _cursor_from_json(
+                        str(state["last_primary_key_json"])
+                    )
+
+                    if sync_mode == "updated" and last_cursor is not None:
+                        cursor_sql = _remote_column_identifier(
+                            credentials.database_type,
+                            cursor_column,
+                        )
+                        primary_sql = _remote_column_identifier(
+                            credentials.database_type,
+                            primary_key,
+                        )
+                        where_clause = (
+                            f" WHERE ({cursor_sql} > %s) "
+                            f"OR ({cursor_sql} = %s AND {primary_sql} > %s)"
+                        )
+                        parameters = (
+                            last_cursor,
+                            last_cursor,
+                            last_primary_key,
+                        )
+                        order_by = f" ORDER BY {cursor_sql}, {primary_sql}"
+                    elif sync_mode == "append" and last_cursor is not None:
+                        primary_sql = _remote_column_identifier(
+                            credentials.database_type,
+                            primary_key,
+                        )
+                        where_clause = f" WHERE {primary_sql} > %s"
+                        parameters = (last_cursor,)
+                        order_by = f" ORDER BY {primary_sql}"
+
+                    query = (
+                        f"SELECT {remote_columns} FROM {remote_table}"
+                        f"{where_clause}{order_by}"
+                    )
+                    if sync_mode == "full":
+                        previous_rows = int(
+                            local.execute(
+                                f"SELECT COUNT(*) FROM "
+                                f"{quote_identifier(local_table)}"
+                            ).fetchone()[0]
+                        )
+                        local.execute(
+                            f"DELETE FROM {quote_identifier(local_table)}"
+                        )
+                        insert_sql = (
+                            f"INSERT INTO {quote_identifier(local_table)} ("
+                            + ", ".join(
+                                quote_identifier(name) for name in columns
+                            )
+                            + ") VALUES ("
+                            + ", ".join("?" for _ in columns)
+                            + ")"
+                        )
+                    else:
+                        previous_rows = 0
+                        insert_sql = _snapshot_upsert_sql(
+                            local_table,
+                            columns,
+                            primary_key,
+                        )
+
+                    primary_index = (
+                        columns.index(primary_key)
+                        if primary_key
+                        else -1
+                    )
+                    cursor_index = (
+                        columns.index(cursor_column)
+                        if cursor_column
+                        else -1
+                    )
+                    table_rows = 0
+                    max_cursor = last_cursor
+                    max_primary_key = last_primary_key
+                    max_sort_key = (
+                        (
+                            _cursor_sort_value(last_cursor),
+                            _cursor_sort_value(last_primary_key),
+                        )
+                        if last_cursor is not None
+                        else None
+                    )
+
+                    with remote.cursor() as cursor:
+                        cursor.execute(query, parameters)
+                        while True:
+                            rows = cursor.fetchmany(1000)
+                            if not rows:
+                                break
+                            local.executemany(
+                                insert_sql,
+                                [
+                                    tuple(_sqlite_value(value) for value in row)
+                                    for row in rows
+                                ],
+                            )
+                            table_rows += len(rows)
+                            rows_synced += len(rows)
+                            if sync_mode in {"updated", "append"}:
+                                for row in rows:
+                                    cursor_value = row[cursor_index]
+                                    primary_value = row[primary_index]
+                                    if (
+                                        cursor_value is None
+                                        or primary_value is None
+                                    ):
+                                        continue
+                                    sort_key = (
+                                        _cursor_sort_value(cursor_value),
+                                        _cursor_sort_value(primary_value),
+                                    )
+                                    if (
+                                        max_sort_key is None
+                                        or sort_key > max_sort_key
+                                    ):
+                                        max_sort_key = sort_key
+                                        max_cursor = cursor_value
+                                        max_primary_key = primary_value
+                            _check_snapshot_size(temporary_path)
+
+                    if table_rows or (sync_mode == "full" and previous_rows):
+                        changed = True
+                    local.execute(
+                        """
+                        UPDATE _chatbi_sync_state
+                        SET last_cursor_json = ?,
+                            last_primary_key_json = ?,
+                            last_synced_at = ?,
+                            rows_synced = ?
+                        WHERE local_table_name = ?
+                        """,
+                        (
+                            _cursor_json(max_cursor),
+                            _cursor_json(max_primary_key),
+                            synced_at,
+                            table_rows,
+                            local_table,
+                        ),
+                    )
+
+                new_version = current_version + 1
+                local.executemany(
+                    """
+                    INSERT INTO _chatbi_source_metadata (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
+                        ("last_sync_epoch", str(now_epoch)),
+                        ("snapshot_updated_at", synced_at),
+                        ("data_version", str(new_version)),
+                    ),
+                )
+                local.commit()
+
+            inspect_sqlite_database(temporary_path)
+            os.replace(temporary_path, path)
+            _harden_private_file(path)
+            published = True
+            return RemoteSyncResult(
+                attempted=True,
+                changed=changed,
+                rows_synced=rows_synced,
+                data_version=new_version,
+                synced_at=synced_at,
+                message=(
+                    f"已同步 {rows_synced} 条变更记录。"
+                    if rows_synced
+                    else "同步完成，源数据没有新变化。"
+                ),
+            )
+        except DataSourceError:
+            raise
+        except Exception as error:
+            raise DataSourceError(
+                f"远程数据库自动同步失败："
+                f"{_safe_driver_error(error, credentials.password)}"
+            ) from error
+        finally:
+            if remote is not None:
+                remote.close()
+            if not published:
+                temporary_path.unlink(missing_ok=True)
 
 
 def list_database_sources() -> list[Path]:
