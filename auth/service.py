@@ -29,6 +29,7 @@ from auth.models import (
     AuthenticationError,
     AuthorizationError,
     DataSourceRecord,
+    PendingDatasourceReview,
     User,
     ValidationError,
 )
@@ -1057,6 +1058,385 @@ class AuthService:
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
+
+    @staticmethod
+    def _normalize_pending_source_key(source_key: str) -> str:
+        normalized = str(source_key or "").strip()
+        if (
+            not normalized
+            or len(normalized) > 255
+            or Path(normalized).name != normalized
+        ):
+            raise ValidationError("待处理数据源标识无效。")
+        return normalized
+
+    @staticmethod
+    def _normalize_field_descriptions(
+        descriptions: Mapping[tuple[str, str], str],
+    ) -> dict[tuple[str, str], str]:
+        normalized: dict[tuple[str, str], str] = {}
+        for raw_key, raw_description in descriptions.items():
+            if not isinstance(raw_key, tuple) or len(raw_key) != 2:
+                raise ValidationError("字段说明的定位信息无效。")
+            table_name = str(raw_key[0] or "").strip()
+            column_name = str(raw_key[1] or "").strip()
+            description = str(raw_description or "").strip()
+            if not table_name or not column_name:
+                raise ValidationError("字段说明必须指定表名和字段名。")
+            if not description:
+                continue
+            if len(description) > 500:
+                raise ValidationError("单个字段说明不能超过 500 个字符。")
+            normalized[(table_name, column_name)] = description
+        return normalized
+
+    def _can_access_pending_review(
+        self,
+        connection: sqlite3.Connection,
+        actor_user_id: int,
+        row: sqlite3.Row,
+    ) -> bool:
+        if self._user_has_permission(
+            connection,
+            actor_user_id,
+            MANAGE_DATASOURCE_ACCESS,
+        ):
+            return True
+        creator = row["created_by"]
+        return creator is not None and int(creator) == int(actor_user_id)
+
+    @staticmethod
+    def _hydrate_pending_review(
+        row: sqlite3.Row,
+    ) -> PendingDatasourceReview:
+        try:
+            report = json.loads(str(row["validation_report_json"] or "{}"))
+        except json.JSONDecodeError:
+            report = {}
+        if not isinstance(report, dict):
+            report = {}
+        return PendingDatasourceReview(
+            id=int(row["id"]),
+            source_key=str(row["source_key"]),
+            display_name=str(row["display_name"]),
+            provider=str(row["provider"]),
+            validation_report=report,
+            created_by=(
+                int(row["created_by"])
+                if row["created_by"] is not None
+                else None
+            ),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def get_pending_datasource_review(
+        self,
+        actor_user_id: int,
+        source_key: str,
+    ) -> PendingDatasourceReview | None:
+        self.require_permission(actor_user_id, IMPORT_DATASOURCE)
+        normalized_key = self._normalize_pending_source_key(source_key)
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM pending_datasource_imports
+                WHERE source_key = ? AND status = 'pending'
+                """,
+                (normalized_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            if not self._can_access_pending_review(
+                connection,
+                actor_user_id,
+                row,
+            ):
+                raise AuthorizationError("当前账号不能查看该待处理数据源。")
+        return self._hydrate_pending_review(row)
+
+    def pending_field_descriptions(
+        self,
+        actor_user_id: int,
+        source_key: str,
+    ) -> dict[tuple[str, str], str]:
+        pending = self.get_pending_datasource_review(
+            actor_user_id,
+            source_key,
+        )
+        if pending is None:
+            return {}
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT table_name, column_name, description
+                FROM pending_datasource_column_metadata
+                WHERE pending_import_id = ?
+                ORDER BY table_name, column_name
+                """,
+                (pending.id,),
+            ).fetchall()
+        return {
+            (str(row["table_name"]), str(row["column_name"])):
+            str(row["description"])
+            for row in rows
+        }
+
+    def upsert_pending_datasource_review(
+        self,
+        actor_user_id: int,
+        actor_session_version: int,
+        *,
+        source_key: str,
+        display_name: str,
+        provider: str,
+        validation_report: Mapping[str, Any],
+    ) -> PendingDatasourceReview:
+        normalized_key = self._normalize_pending_source_key(source_key)
+        normalized_name = str(display_name or "").strip()[:200]
+        normalized_provider = str(provider or "").strip()[:50]
+        if not normalized_name or not normalized_provider:
+            raise ValidationError("待处理数据源缺少名称或类型。")
+        report_json = json.dumps(
+            self._sanitize_details(dict(validation_report)),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        now = utc_timestamp()
+        with self.database.transaction() as connection:
+            self._validate_session_in_connection(
+                connection,
+                actor_user_id,
+                actor_session_version,
+            )
+            if not self._user_has_permission(
+                connection,
+                actor_user_id,
+                IMPORT_DATASOURCE,
+            ):
+                raise AuthorizationError("当前账号没有导入数据源的权限。")
+            existing = connection.execute(
+                "SELECT * FROM pending_datasource_imports WHERE source_key = ?",
+                (normalized_key,),
+            ).fetchone()
+            if existing is not None and not self._can_access_pending_review(
+                connection,
+                actor_user_id,
+                existing,
+            ):
+                raise AuthorizationError("当前账号不能修改该待处理数据源。")
+            if existing is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO pending_datasource_imports (
+                        source_key, display_name, provider, status,
+                        validation_report_json, created_by, created_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_key,
+                        normalized_name,
+                        normalized_provider,
+                        report_json,
+                        actor_user_id,
+                        now,
+                        now,
+                    ),
+                )
+                pending_id = int(cursor.lastrowid)
+            else:
+                pending_id = int(existing["id"])
+                connection.execute(
+                    """
+                    UPDATE pending_datasource_imports
+                    SET display_name = ?, provider = ?, status = 'pending',
+                        validation_report_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_name,
+                        normalized_provider,
+                        report_json,
+                        now,
+                        pending_id,
+                    ),
+                )
+            self._audit(
+                connection,
+                actor_user_id=actor_user_id,
+                action="datasource_field_preflight",
+                outcome="success",
+                target_type="pending_datasource_review",
+                target_id=pending_id,
+                details={"status": "needs_review"},
+            )
+            row = connection.execute(
+                "SELECT * FROM pending_datasource_imports WHERE id = ?",
+                (pending_id,),
+            ).fetchone()
+        assert row is not None
+        return self._hydrate_pending_review(row)
+
+    def replace_pending_field_descriptions(
+        self,
+        actor_user_id: int,
+        actor_session_version: int,
+        *,
+        source_key: str,
+        descriptions: Mapping[tuple[str, str], str],
+    ) -> None:
+        normalized_key = self._normalize_pending_source_key(source_key)
+        normalized_descriptions = self._normalize_field_descriptions(
+            descriptions,
+        )
+        now = utc_timestamp()
+        with self.database.transaction() as connection:
+            self._validate_session_in_connection(
+                connection,
+                actor_user_id,
+                actor_session_version,
+            )
+            if not self._user_has_permission(
+                connection,
+                actor_user_id,
+                IMPORT_DATASOURCE,
+            ):
+                raise AuthorizationError("当前账号没有导入数据源的权限。")
+            pending = connection.execute(
+                """
+                SELECT * FROM pending_datasource_imports
+                WHERE source_key = ? AND status = 'pending'
+                """,
+                (normalized_key,),
+            ).fetchone()
+            if pending is None:
+                raise ValidationError("待处理数据源不存在或已失效。")
+            if not self._can_access_pending_review(
+                connection,
+                actor_user_id,
+                pending,
+            ):
+                raise AuthorizationError("当前账号不能修改该待处理数据源。")
+            pending_id = int(pending["id"])
+            connection.execute(
+                """
+                DELETE FROM pending_datasource_column_metadata
+                WHERE pending_import_id = ?
+                """,
+                (pending_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO pending_datasource_column_metadata (
+                    pending_import_id, table_name, column_name, description,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        pending_id,
+                        table_name,
+                        column_name,
+                        description,
+                        now,
+                    )
+                    for (table_name, column_name), description
+                    in normalized_descriptions.items()
+                ],
+            )
+            connection.execute(
+                """
+                UPDATE pending_datasource_imports
+                SET updated_at = ?
+                WHERE id = ?
+                """,
+                (now, pending_id),
+            )
+            self._audit(
+                connection,
+                actor_user_id=actor_user_id,
+                action="update_pending_field_descriptions",
+                outcome="success",
+                target_type="pending_datasource_review",
+                target_id=pending_id,
+                details={"field_count": len(normalized_descriptions)},
+            )
+
+    def finish_pending_datasource_review(
+        self,
+        actor_user_id: int,
+        actor_session_version: int,
+        *,
+        source_key: str,
+    ) -> None:
+        self._delete_pending_datasource_review(
+            actor_user_id,
+            actor_session_version,
+            source_key=source_key,
+            audit_action="complete_pending_datasource_review",
+        )
+
+    def discard_pending_datasource_review(
+        self,
+        actor_user_id: int,
+        actor_session_version: int,
+        *,
+        source_key: str,
+    ) -> None:
+        self._delete_pending_datasource_review(
+            actor_user_id,
+            actor_session_version,
+            source_key=source_key,
+            audit_action="discard_pending_datasource_review",
+        )
+
+    def _delete_pending_datasource_review(
+        self,
+        actor_user_id: int,
+        actor_session_version: int,
+        *,
+        source_key: str,
+        audit_action: str,
+    ) -> None:
+        normalized_key = self._normalize_pending_source_key(source_key)
+        with self.database.transaction() as connection:
+            self._validate_session_in_connection(
+                connection,
+                actor_user_id,
+                actor_session_version,
+            )
+            pending = connection.execute(
+                """
+                SELECT * FROM pending_datasource_imports
+                WHERE source_key = ? AND status = 'pending'
+                """,
+                (normalized_key,),
+            ).fetchone()
+            if pending is None:
+                return
+            if not self._can_access_pending_review(
+                connection,
+                actor_user_id,
+                pending,
+            ):
+                raise AuthorizationError("当前账号不能处理该待处理数据源。")
+            pending_id = int(pending["id"])
+            connection.execute(
+                "DELETE FROM pending_datasource_imports WHERE id = ?",
+                (pending_id,),
+            )
+            self._audit(
+                connection,
+                actor_user_id=actor_user_id,
+                action=audit_action,
+                outcome="success",
+                target_type="pending_datasource_review",
+                target_id=pending_id,
+            )
 
     def sync_datasources(
         self,

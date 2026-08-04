@@ -177,6 +177,30 @@ class MetaDatabase:
                     PRIMARY KEY (user_id, datasource_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS pending_datasource_imports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_key TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'discarded')),
+                    validation_report_json TEXT NOT NULL DEFAULT '{}',
+                    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS pending_datasource_column_metadata (
+                    pending_import_id INTEGER NOT NULL
+                        REFERENCES pending_datasource_imports(id)
+                        ON DELETE CASCADE,
+                    table_name TEXT NOT NULL,
+                    column_name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (pending_import_id, table_name, column_name)
+                );
+
                 CREATE TABLE IF NOT EXISTS audit_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     actor_user_id INTEGER
@@ -223,6 +247,8 @@ class MetaDatabase:
                     ON audit_logs(actor_user_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_datasource_permissions_user
                     ON datasource_permissions(user_id);
+                CREATE INDEX IF NOT EXISTS idx_pending_datasource_reviews_owner
+                    ON pending_datasource_imports(created_by, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_dashboard_queries_owner
                     ON saved_dashboard_queries(owner_user_id, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_dashboard_queries_datasource

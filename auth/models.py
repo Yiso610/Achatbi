@@ -67,6 +67,20 @@ class DataSourceRecord:
 
 
 @dataclass(frozen=True)
+class PendingDatasourceReview:
+    """A remote source waiting for field clarification before import."""
+
+    id: int
+    source_key: str
+    display_name: str
+    provider: str
+    validation_report: dict[str, Any]
+    created_by: int | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class AuditRecord:
     """A normalized audit row for the administrator UI."""
 

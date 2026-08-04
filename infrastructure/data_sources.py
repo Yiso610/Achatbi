@@ -13,7 +13,8 @@ from pathlib import Path
 import re
 import socket
 import sqlite3
-from typing import Any
+import unicodedata
+from typing import Any, Mapping
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
@@ -58,12 +59,67 @@ class StagedDatabaseSnapshot:
 
 
 @dataclass(frozen=True)
+class FieldReadinessIssue:
+    """One field problem that needs user review before import."""
+
+    table_name: str
+    column_name: str | None
+    code: str
+    message: str
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "table_name": self.table_name,
+            "column_name": self.column_name,
+            "code": self.code,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class FieldReadinessReport:
+    """Result of a conservative field-name readability check."""
+
+    status: str
+    table_count: int
+    column_count: int
+    issues: tuple[FieldReadinessIssue, ...]
+
+    @property
+    def is_ready(self) -> bool:
+        return self.status == "passed"
+
+    @property
+    def needs_review(self) -> bool:
+        return self.status == "needs_review"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "table_count": self.table_count,
+            "column_count": self.column_count,
+            "issues": [issue.to_dict() for issue in self.issues],
+        }
+
+
+@dataclass(frozen=True)
+class RemoteDatabasePreflight:
+    """A metadata-only inspection performed before a full snapshot."""
+
+    provider: str
+    source_key: str
+    database: str
+    report: FieldReadinessReport
+
+
+@dataclass(frozen=True)
 class _ExcelSheetSpec:
     sheet_name: str
     table_name: str
     header_row_number: int
     columns: tuple[dict[str, str], ...]
     row_count: int
+    readiness_issues: tuple[FieldReadinessIssue, ...] = ()
 
 
 # 保护数据库快照
@@ -328,6 +384,130 @@ def _validate_excel_upload(original_name: str, content: bytes) -> None:
         raise DataSourceError("文件不是有效的 Excel 工作簿。") from error
 
 
+def _excel_header_readiness_issues(
+    table_name: str,
+    header_values: list[Any],
+    sample_rows: list[list[Any]],
+) -> tuple[FieldReadinessIssue, ...]:
+    """Detect a first row that is data rather than a semantic header."""
+    issues: list[FieldReadinessIssue] = []
+    row_looks_like_data = _excel_header_row_looks_like_data(
+        header_values,
+        sample_rows,
+    )
+    for column_index, raw_header in enumerate(header_values, start=1):
+        column_name = str(raw_header or "").strip()
+        if not column_name:
+            issues.append(
+                FieldReadinessIssue(
+                    table_name=table_name,
+                    column_name=None,
+                    code="missing_field_name",
+                    message=(
+                        f"工作表“{table_name}”第 {column_index} 列没有字段名。"
+                    ),
+                )
+            )
+            continue
+
+        header_type = _excel_value_type(raw_header)
+        data_types = [
+            _excel_value_type(row[column_index - 1])
+            for row in sample_rows
+            if len(row) >= column_index
+            and _excel_value_type(row[column_index - 1]) is not None
+        ]
+        same_as_data = bool(
+            header_type
+            and header_type != "TEXT"
+            and data_types
+            and all(value_type == header_type for value_type in data_types)
+        )
+        numeric_text_header = bool(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", column_name))
+        normalized_column_name = _safe_excel_identifier(
+            raw_header,
+            f"column_{column_index}",
+            set(),
+        )
+        if row_looks_like_data:
+            issues.append(
+                FieldReadinessIssue(
+                    table_name=table_name,
+                    column_name=normalized_column_name,
+                    code="header_row_looks_like_data",
+                    message=(
+                        f"工作表“{table_name}”第 {column_index} 列的首行值“"
+                        f"{column_name}”属于疑似数据行，"
+                        "不能作为字段名。"
+                    ),
+                )
+            )
+        elif not isinstance(raw_header, str) or numeric_text_header or same_as_data:
+            issues.append(
+                FieldReadinessIssue(
+                    table_name=table_name,
+                    column_name=normalized_column_name,
+                    code="header_looks_like_data",
+                    message=(
+                        f"工作表“{table_name}”第 {column_index} 列的首行值“"
+                        f"{column_name}”与后续数据类型一致，"
+                        "看起来是数据而不是字段名。"
+                    ),
+                )
+            )
+        elif field_name_is_ambiguous(normalized_column_name):
+            issues.append(
+                FieldReadinessIssue(
+                    table_name=table_name,
+                    column_name=normalized_column_name,
+                    code="ambiguous_field_name",
+                    message=(
+                        f"工作表“{table_name}”第 {column_index} 列的字段名“"
+                        f"{normalized_column_name}”过于模糊。"
+                    ),
+                )
+            )
+    return tuple(issues)
+
+
+def _excel_header_row_looks_like_data(
+    header_values: list[Any],
+    sample_rows: list[list[Any]],
+) -> bool:
+    """Detect an all-text first row that follows the same pattern as data."""
+    if len(header_values) < 2 or len(sample_rows) < 2:
+        return False
+    comparable_columns = 0
+    matching_columns = 0
+    ambiguous_columns = 0
+    for column_index, raw_header in enumerate(header_values):
+        if not isinstance(raw_header, str) or not raw_header.strip():
+            return False
+        column_name = _safe_excel_identifier(
+            raw_header,
+            f"column_{column_index + 1}",
+            set(),
+        )
+        if field_name_is_ambiguous(column_name):
+            ambiguous_columns += 1
+        data_types = [
+            _excel_value_type(row[column_index])
+            for row in sample_rows
+            if len(row) > column_index
+            and _excel_value_type(row[column_index]) is not None
+        ]
+        if not data_types:
+            continue
+        comparable_columns += 1
+        if all(value_type == "TEXT" for value_type in data_types):
+            matching_columns += 1
+    return (
+        comparable_columns >= 2
+        and matching_columns >= max(1, (len(header_values) + 1) // 2)
+        and ambiguous_columns == len(header_values)
+    )
+
+
 def _scan_excel_workbook(content: bytes) -> list[_ExcelSheetSpec]:
     """Inspect sheets, infer a SQLite schema, and enforce import limits."""
     try:
@@ -364,6 +544,7 @@ def _scan_excel_workbook(content: bytes) -> list[_ExcelSheetSpec]:
             header_row_number = 0
             inferred_types: list[str | None] = []
             row_count = 0
+            sample_rows: list[list[Any]] = []
 
             for row_number, raw_row in enumerate(
                 worksheet.iter_rows(values_only=True),
@@ -392,6 +573,8 @@ def _scan_excel_workbook(content: bytes) -> list[_ExcelSheetSpec]:
 
                 row_count += 1
                 total_rows += 1
+                if len(sample_rows) < 10:
+                    sample_rows.append(values[:])
                 if total_rows > MAX_EXCEL_ROWS:
                     raise DataSourceError(
                         f"Excel 数据总行数不能超过 {MAX_EXCEL_ROWS:,} 行。"
@@ -435,6 +618,11 @@ def _scan_excel_workbook(content: bytes) -> list[_ExcelSheetSpec]:
                 used_table_names,
                 max_length=60,
             )
+            readiness_issues = _excel_header_readiness_issues(
+                table_name,
+                header_values,
+                sample_rows,
+            )
             specs.append(
                 _ExcelSheetSpec(
                     sheet_name=worksheet.title,
@@ -442,6 +630,7 @@ def _scan_excel_workbook(content: bytes) -> list[_ExcelSheetSpec]:
                     header_row_number=header_row_number,
                     columns=tuple(columns),
                     row_count=row_count,
+                    readiness_issues=readiness_issues,
                 )
             )
     finally:
@@ -474,6 +663,18 @@ def stage_excel_workbook(
     """Convert an Excel workbook into a private, query-ready SQLite snapshot."""
     _validate_excel_upload(original_name, content)
     specs = _scan_excel_workbook(content)
+    readiness_issues = tuple(
+        issue
+        for spec in specs
+        for issue in spec.readiness_issues
+    )
+    if readiness_issues:
+        messages = "；".join(issue.message for issue in readiness_issues[:5])
+        suffix = "" if len(readiness_issues) <= 5 else "；其余问题已省略"
+        raise DataSourceError(
+            "Excel 表头检查未通过："
+            f"{messages}{suffix}。请将第一行改成真实字段名后重新上传。"
+        )
     ensure_private_upload_directory()
 
     target_path = _safe_excel_snapshot_path(original_name, content)
@@ -813,6 +1014,242 @@ def list_remote_databases(
     return databases
 
 
+_AMBIGUOUS_FIELD_NAMES = {
+    "abc",
+    "attr",
+    "attribute",
+    "asdf",
+    "bar",
+    "baz",
+    "column",
+    "data",
+    "field",
+    "foo",
+    "haha",
+    "hello",
+    "hi",
+    "lalala",
+    "misc",
+    "other",
+    "qwerty",
+    "temp",
+    "test",
+    "testing",
+    "tmp",
+    "undefined",
+    "unknown",
+    "unnamed",
+    "value",
+    "var",
+    "variable",
+    "xxx",
+    "xyz",
+    "哈哈",
+    "呵呵",
+    "你好",
+    "我",
+    "他",
+    "值",
+    "字段",
+    "数据",
+    "未知",
+    "未命名",
+    "列",
+}
+_COMMON_SHORT_FIELD_NAMES = {
+    "年龄",
+    "地址",
+    "编号",
+    "部门",
+    "城市",
+    "代码",
+    "电话",
+    "地区",
+    "日期",
+    "金额",
+    "公司",
+    "国家",
+    "类别",
+    "类型",
+    "名称",
+    "票价",
+    "票号",
+    "数量",
+    "备注",
+    "邮箱",
+    "姓名",
+    "性别",
+    "状态",
+    "时间",
+    "手机",
+    "销量",
+    "价格",
+    "资产",
+    "收入",
+    "工资",
+    "产品",
+    "客户",
+    "订单",
+    "员工",
+    "活跃",
+    "启用",
+    "有效",
+    "是否",
+    "删除",
+    "版本",
+    "主键",
+    "唯一",
+    "天数",
+    "月份",
+    "年份",
+}
+_NUMBERED_PLACEHOLDER_PATTERN = re.compile(
+    r"(?:attr(?:ibute)?|c|col(?:umn)?|data|f(?:ield|ld)?|"
+    r"unnamed|unknown|v(?:alue|ar(?:iable)?)?|x|y|z)[_-]*\d+",
+    re.IGNORECASE,
+)
+_CHINESE_PLACEHOLDER_PATTERN = re.compile(
+    r"(?:字段|数据|未知|未命名|列|值)[_-]*\d+"
+)
+
+
+def field_name_is_ambiguous(field_name: str) -> bool:
+    """Return True only for high-confidence placeholder or opaque names.
+
+    Ordinary business names do not require a database comment.  In
+    particular, names such as ``age``, ``PassengerId``, ``SibSp`` and
+    ``订单金额`` are accepted.  The check intentionally favors avoiding false
+    positives over trying to understand every possible business abbreviation.
+    """
+    normalized = unicodedata.normalize(
+        "NFKC",
+        str(field_name or ""),
+    ).strip()
+    if not normalized:
+        return False
+    if "\ufffd" in normalized:
+        return True
+
+    canonical = re.sub(
+        r"[^\w\u4e00-\u9fff]+",
+        "_",
+        normalized,
+    ).strip("_").casefold()
+    if not canonical:
+        return True
+    if canonical in _AMBIGUOUS_FIELD_NAMES:
+        return True
+    if (
+        re.fullmatch(r"[\u4e00-\u9fff]{2,4}", canonical)
+        and canonical not in _COMMON_SHORT_FIELD_NAMES
+    ):
+        return True
+    if re.fullmatch(r"(.{1,3})\1{2,}", canonical):
+        return True
+    if _NUMBERED_PLACEHOLDER_PATTERN.fullmatch(canonical):
+        return True
+    if _CHINESE_PLACEHOLDER_PATTERN.fullmatch(canonical):
+        return True
+    if re.fullmatch(r"(?:expr|expression|no_column_name)[_-]*\d*", canonical):
+        return True
+    if re.fullmatch(r"[a-z]", canonical):
+        return True
+    if re.fullmatch(r"[a-z]\d+[a-z]?", canonical):
+        return True
+    if not any(character.isalpha() for character in canonical):
+        return True
+    if (
+        len(canonical) >= 8
+        and re.fullmatch(r"[a-f0-9]+", canonical)
+        and re.search(r"[a-f]", canonical)
+        and re.search(r"\d", canonical)
+    ):
+        return True
+    return False
+
+
+def validate_table_specs_readiness(
+    table_specs: list[dict[str, Any]],
+    field_descriptions: Mapping[tuple[str, str], str] | None = None,
+) -> FieldReadinessReport:
+    """Check field presence and readability without requiring comments."""
+    descriptions = field_descriptions or {}
+    issues: list[FieldReadinessIssue] = []
+    column_count = 0
+
+    if not table_specs:
+        return FieldReadinessReport(
+            status="needs_review",
+            table_count=0,
+            column_count=0,
+            issues=(
+                FieldReadinessIssue(
+                    table_name="",
+                    column_name=None,
+                    code="no_queryable_tables",
+                    message="数据库中不存在可读取的数据表或字段。",
+                ),
+            ),
+        )
+
+    for table in table_specs:
+        table_name = str(
+            table.get("local_name") or table.get("name") or ""
+        ).strip()
+        columns = table.get("columns") or []
+        display_table = table_name or "未命名表"
+        if not columns:
+            issues.append(
+                FieldReadinessIssue(
+                    table_name=table_name,
+                    column_name=None,
+                    code="no_fields",
+                    message=f"数据表“{display_table}”不存在任何字段。",
+                )
+            )
+            continue
+
+        for column in columns:
+            column_count += 1
+            column_name = str(column.get("name") or "").strip()
+            if not column_name:
+                issues.append(
+                    FieldReadinessIssue(
+                        table_name=table_name,
+                        column_name=None,
+                        code="missing_field_name",
+                        message=f"数据表“{display_table}”存在字段名称缺失。",
+                    )
+                )
+                continue
+
+            supplied_description = str(
+                descriptions.get((table_name, column_name), "")
+            ).strip()
+            source_comment = str(column.get("comment") or "").strip()
+            if supplied_description or source_comment:
+                continue
+            if field_name_is_ambiguous(column_name):
+                issues.append(
+                    FieldReadinessIssue(
+                        table_name=table_name,
+                        column_name=column_name,
+                        code="ambiguous_field_name",
+                        message=(
+                            f"数据表“{display_table}”的字段“{column_name}”"
+                            "名称过于模糊，请补充业务含义。"
+                        ),
+                    )
+                )
+
+    return FieldReadinessReport(
+        status="needs_review" if issues else "passed",
+        table_count=len(table_specs),
+        column_count=column_count,
+        issues=tuple(issues),
+    )
+
+
 def _sqlite_type(source_type: str) -> str:
     """Map common MySQL/PostgreSQL types to SQLite affinity."""
     normalized = source_type.lower()
@@ -931,6 +1368,8 @@ def _create_snapshot_table(
     local: sqlite3.Connection,
     local_table_name: str,
     columns: list[dict[str, str]],
+    *,
+    field_descriptions: Mapping[tuple[str, str], str] | None = None,
 ) -> str:
     """Create one SQLite table and return its parameterized insert SQL."""
     column_definitions = ", ".join(
@@ -943,9 +1382,16 @@ def _create_snapshot_table(
         f"({column_definitions})"
     )
 
+    descriptions = field_descriptions or {}
     for column in columns:
         description = (
-            column.get("comment", "").strip()
+            str(
+                descriptions.get(
+                    (local_table_name, column["name"]),
+                    "",
+                )
+            ).strip()
+            or column.get("comment", "").strip()
             or f"{column['source_type']} column from remote database"
         )
         local.execute(
@@ -1015,15 +1461,14 @@ def _mysql_table_specs(connection, database: str) -> list[dict[str, Any]]:
                 }
                 for row in cursor.fetchall()
             ]
-            if columns:
-                specs.append(
-                    {
-                        "schema": database,
-                        "name": table_name,
-                        "local_name": table_name,
-                        "columns": columns,
-                    }
-                )
+            specs.append(
+                {
+                    "schema": database,
+                    "name": table_name,
+                    "local_name": table_name,
+                    "columns": columns,
+                }
+            )
     return specs
 
 
@@ -1050,13 +1495,25 @@ def _postgresql_table_specs(connection) -> list[dict[str, Any]]:
             cursor.execute(
                 """
                 SELECT
-                    column_name,
-                    data_type,
-                    udt_name
-                FROM information_schema.columns
-                WHERE table_schema = %s
-                  AND table_name = %s
-                ORDER BY ordinal_position
+                    columns.column_name,
+                    columns.data_type,
+                    columns.udt_name,
+                    COALESCE(
+                        pg_catalog.col_description(
+                            relation.oid,
+                            columns.ordinal_position
+                        ),
+                        ''
+                    )
+                FROM information_schema.columns AS columns
+                LEFT JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.nspname = columns.table_schema
+                LEFT JOIN pg_catalog.pg_class AS relation
+                  ON relation.relnamespace = namespace.oid
+                 AND relation.relname = columns.table_name
+                WHERE columns.table_schema = %s
+                  AND columns.table_name = %s
+                ORDER BY columns.ordinal_position
                 """,
                 (schema_name, table_name),
             )
@@ -1064,12 +1521,10 @@ def _postgresql_table_specs(connection) -> list[dict[str, Any]]:
                 {
                     "name": str(row[0]),
                     "source_type": str(row[2] or row[1]),
-                    "comment": "",
+                    "comment": str(row[3] or ""),
                 }
                 for row in cursor.fetchall()
             ]
-            if not columns:
-                continue
 
             use_plain_name = (
                 schema_name == "public"
@@ -1091,6 +1546,80 @@ def _postgresql_table_specs(connection) -> list[dict[str, Any]]:
     return specs
 
 
+def preflight_remote_database(
+    database_type: str,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: str,
+    *,
+    field_descriptions: Mapping[tuple[str, str], str] | None = None,
+) -> RemoteDatabasePreflight:
+    """Read remote catalog metadata without copying business rows."""
+    provider, host, port, user = _validate_remote_connection(
+        database_type,
+        host,
+        port,
+        user,
+    )
+    normalized_database = database.strip()
+    if not normalized_database:
+        raise DataSourceError("请选择需要添加的数据库。")
+
+    target_path = _safe_remote_snapshot_path(
+        provider,
+        host,
+        port,
+        user,
+        normalized_database,
+    )
+    connection = None
+    try:
+        if provider == "MySQL":
+            connection = _connect_mysql(
+                host,
+                port,
+                user,
+                password,
+                normalized_database,
+            )
+            table_specs = _mysql_table_specs(connection, normalized_database)
+        else:
+            connection = _connect_postgresql(
+                host,
+                port,
+                user,
+                password,
+                normalized_database,
+            )
+            table_specs = _postgresql_table_specs(connection)
+    except DataSourceError:
+        raise
+    except pymysql.MySQLError as error:
+        raise DataSourceError(
+            f"MySQL 元数据读取失败：{_safe_driver_error(error, password)}"
+        ) from error
+    except Exception as error:
+        raise DataSourceError(
+            f"{provider} 元数据读取失败："
+            f"{_safe_driver_error(error, password)}"
+        ) from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+    return RemoteDatabasePreflight(
+        provider=provider,
+        source_key=target_path.name,
+        database=normalized_database,
+        report=validate_table_specs_readiness(
+            table_specs,
+            field_descriptions,
+        ),
+    )
+
+
 def stage_remote_database(
     database_type: str,
     host: str,
@@ -1098,6 +1627,8 @@ def stage_remote_database(
     user: str,
     password: str,
     database: str,
+    *,
+    field_descriptions: Mapping[tuple[str, str], str] | None = None,
 ) -> StagedDatabaseSnapshot:
     """Build and validate a private snapshot without publishing it."""
     provider, host, port, user = _validate_remote_connection(
@@ -1162,8 +1693,14 @@ def stage_remote_database(
                     f"{_safe_driver_error(error, password)}"
                 ) from error
 
-        if not table_specs:
-            raise DataSourceError("所选数据库中没有可导入的数据表。")
+        readiness = validate_table_specs_readiness(
+            table_specs,
+            field_descriptions,
+        )
+        if readiness.needs_review:
+            raise DataSourceError(
+                "数据库字段在同步前未通过检查，请重新检查并处理字段问题。"
+            )
 
         with sqlite3.connect(temporary_path) as local:
             local.execute("PRAGMA foreign_keys = OFF")
@@ -1174,6 +1711,7 @@ def stage_remote_database(
                     local,
                     table["local_name"],
                     table["columns"],
+                    field_descriptions=field_descriptions,
                 )
 
                 if provider == "MySQL":

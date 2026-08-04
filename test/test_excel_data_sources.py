@@ -36,7 +36,7 @@ class ExcelDataSourceTestCase(unittest.TestCase):
         sales = workbook.active
         sales.title = "销售 数据"
         sales.append([])
-        sales.append(["订单 ID", "金额", "日期", "金额", None])
+        sales.append(["订单 ID", "金额", "日期", "金额", "地区"])
         sales.append([1, 12.5, datetime(2026, 8, 1, 9, 30), "含税", "华东"])
         sales.append([2, 8, datetime(2026, 8, 2, 10, 0), "未税", "华南"])
         sales.append([None, None, None, None, None])
@@ -76,7 +76,7 @@ class ExcelDataSourceTestCase(unittest.TestCase):
         )
         self.assertEqual(
             [column["name"] for column in sales["columns"]],
-            ["订单_ID", "金额", "日期", "金额_2", "column_5"],
+            ["订单_ID", "金额", "日期", "金额_2", "地区"],
         )
         self.assertEqual(
             [column["type"] for column in sales["columns"]],
@@ -85,7 +85,7 @@ class ExcelDataSourceTestCase(unittest.TestCase):
 
         with sqlite3.connect(snapshot.staged_path) as connection:
             rows = connection.execute(
-                'SELECT "订单_ID", "金额", "column_5" '
+                'SELECT "订单_ID", "金额", "地区" '
                 'FROM "销售_数据" ORDER BY "订单_ID"'
             ).fetchall()
             metadata = dict(
@@ -119,6 +119,60 @@ class ExcelDataSourceTestCase(unittest.TestCase):
                     "too-wide.xlsx",
                     self._workbook_bytes(),
                 )
+        self.assertEqual(list(self.upload_directory.iterdir()), [])
+
+    def test_first_data_row_is_not_accepted_as_excel_header(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "随机数据"
+        sheet.append([234, "你好"])
+        sheet.append([2, "呵呵"])
+        sheet.append([9888, "我"])
+        sheet.append([23456, "他"])
+        sheet.append([567, "公司"])
+        sheet.append([82, "手机"])
+        stream = BytesIO()
+        workbook.save(stream)
+        workbook.close()
+
+        with self.assertRaisesRegex(
+            data_sources.DataSourceError,
+            "首行值.*看起来是数据而不是字段名",
+        ):
+            data_sources.stage_excel_workbook(
+                "test excel.xlsx",
+                stream.getvalue(),
+            )
+        self.assertEqual(list(self.upload_directory.iterdir()), [])
+
+    def test_unrelated_text_headers_are_not_accepted(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "随机文本"
+        sheet.append(["lalala", "你好"])
+        sheet.append(["A01", "呵呵"])
+        sheet.append(["A02", "我"])
+        stream = BytesIO()
+        workbook.save(stream)
+        workbook.close()
+
+        specs = data_sources._scan_excel_workbook(stream.getvalue())
+        self.assertEqual(
+            [
+                issue.column_name
+                for spec in specs
+                for issue in spec.readiness_issues
+            ],
+            ["lalala", "你好"],
+        )
+        with self.assertRaisesRegex(
+            data_sources.DataSourceError,
+            "lalala.*不能作为字段名",
+        ):
+            data_sources.stage_excel_workbook(
+                "unrelated.xlsx",
+                stream.getvalue(),
+            )
         self.assertEqual(list(self.upload_directory.iterdir()), [])
 
 

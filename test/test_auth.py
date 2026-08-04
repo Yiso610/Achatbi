@@ -169,7 +169,62 @@ class AuthServiceTestCase(unittest.TestCase):
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
         self.assertEqual(str(row["source_key"]), "legacy.db")
-        self.assertEqual(int(latest), 3)
+        self.assertEqual(int(latest), 4)
+
+    def test_pending_field_review_lifecycle_and_access_isolation(self) -> None:
+        source_key = "mysql_events-a1b2c3.db"
+        report = {
+            "status": "needs_review",
+            "table_count": 1,
+            "column_count": 2,
+            "issues": [
+                {
+                    "table_name": "events",
+                    "column_name": "c1",
+                    "code": "ambiguous_field_name",
+                    "message": "字段名称过于模糊",
+                }
+            ],
+        }
+        pending = self.service.upsert_pending_datasource_review(
+            self.admin.id,
+            self.admin.session_version,
+            source_key=source_key,
+            display_name="events",
+            provider="MySQL",
+            validation_report=report,
+        )
+        self.assertEqual(pending.validation_report, report)
+
+        self.service.replace_pending_field_descriptions(
+            self.admin.id,
+            self.admin.session_version,
+            source_key=source_key,
+            descriptions={("events", "c1"): "设备所在区域"},
+        )
+        self.assertEqual(
+            self.service.pending_field_descriptions(
+                self.admin.id,
+                source_key,
+            ),
+            {("events", "c1"): "设备所在区域"},
+        )
+
+        manager = self.create_user("manager", ROLE_DATA_MANAGER)
+        with self.assertRaises(AuthorizationError):
+            self.service.pending_field_descriptions(manager.id, source_key)
+
+        self.service.finish_pending_datasource_review(
+            self.admin.id,
+            self.admin.session_version,
+            source_key=source_key,
+        )
+        self.assertIsNone(
+            self.service.get_pending_datasource_review(
+                self.admin.id,
+                source_key,
+            )
+        )
 
     def test_role_permission_matrix(self) -> None:
         viewer = self.create_user("viewer", ROLE_VIEWER)

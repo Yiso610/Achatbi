@@ -34,10 +34,12 @@ from auth.ui import (
 )
 from infrastructure.data_sources import (
     DataSourceError,
+    FieldReadinessReport,
     database_display_name,
     inspect_sqlite_database,
     list_database_sources,
     list_remote_databases,
+    preflight_remote_database,
     stage_excel_workbook,
     stage_remote_database,
 )
@@ -564,6 +566,124 @@ def _clear_query_state(*, clear_draft: bool = True) -> None:
         st.session_state.pop(key, None)
 
 
+def _render_field_readiness_report(report: FieldReadinessReport) -> None:
+    st.warning(
+        "该数据库已进入待处理状态，尚未生成可查询的数据副本。"
+    )
+    st.caption(
+        f"已检查 {report.table_count} 张表、{report.column_count} 个字段；"
+        f"发现 {len(report.issues)} 个需要处理的问题。"
+    )
+    grouped: dict[str, list[str]] = {}
+    for issue in report.issues:
+        table_name = issue.table_name or "数据库结构"
+        grouped.setdefault(table_name, []).append(issue.message)
+    for table_name, messages in grouped.items():
+        st.markdown(f"**{table_name}**")
+        for message in messages:
+            st.caption(f"• {message}")
+
+
+def _render_pending_field_editor(
+    current_user: User,
+    service: AuthService,
+    *,
+    source_key: str,
+    report: FieldReadinessReport,
+) -> None:
+    editable_fields = [
+        (issue.table_name, issue.column_name)
+        for issue in report.issues
+        if issue.code == "ambiguous_field_name"
+        and issue.table_name
+        and issue.column_name
+    ]
+    try:
+        existing = service.pending_field_descriptions(
+            current_user.id,
+            source_key,
+        )
+    except AuthError as error:
+        st.error(str(error))
+        return
+
+    if editable_fields:
+        st.markdown("**补充模糊字段的业务含义**")
+        st.caption(
+            "只需说明上面列出的模糊字段；清晰字段无需填写。"
+            "这些说明只保存在平台，不会修改远程数据库。"
+        )
+        values: dict[tuple[str, str], str] = {}
+        with st.form(f"pending_field_review_{source_key}"):
+            current_table = ""
+            for table_name, column_name in editable_fields:
+                assert column_name is not None
+                if table_name != current_table:
+                    current_table = table_name
+                    st.markdown(f"`{table_name}`")
+                values[(table_name, column_name)] = st.text_input(
+                    f"{column_name} 的业务含义",
+                    value=existing.get((table_name, column_name), ""),
+                    key=(
+                        f"pending_field_{source_key}_"
+                        f"{table_name}_{column_name}"
+                    ),
+                    placeholder="例如：乘客登船时的年龄，单位为岁",
+                )
+            save_descriptions = st.form_submit_button(
+                "保存字段说明",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if save_descriptions:
+            missing = [
+                f"{table_name}.{column_name}"
+                for (table_name, column_name), value in values.items()
+                if not str(value).strip()
+            ]
+            if missing:
+                st.error("请先填写所有模糊字段的业务含义。")
+            else:
+                try:
+                    service.replace_pending_field_descriptions(
+                        current_user.id,
+                        current_user.session_version,
+                        source_key=source_key,
+                        descriptions=values,
+                    )
+                    st.session_state.remote_field_review_notice = (
+                        "字段说明已保存，请再次点击“重新检查并添加”。"
+                    )
+                    st.rerun()
+                except AuthError as error:
+                    st.error(str(error))
+    else:
+        st.info(
+            "当前问题无法通过补充说明解决。请先在源数据库中补齐字段，"
+            "然后重新检查；也可以放弃本次待处理记录。"
+        )
+
+    if st.button(
+        "放弃并移除暂存",
+        key=f"discard_field_review_{source_key}",
+        use_container_width=True,
+    ):
+        try:
+            service.discard_pending_datasource_review(
+                current_user.id,
+                current_user.session_version,
+                source_key=source_key,
+            )
+            st.session_state.pop("remote_field_review", None)
+            st.session_state.remote_field_review_notice = (
+                "已移除待处理记录，可以修复源数据库后重新添加。"
+            )
+            st.rerun()
+        except AuthError as error:
+            st.error(str(error))
+
+
 # 删除数据库弹窗和确认流程
 @st.dialog("确认删除数据库")
 def _confirm_database_deletion(
@@ -727,11 +847,24 @@ def _render_remote_database_import(
             options=remote_catalog["databases"],
             key=f"{provider_key}_database_name",
         )
+        review_notice = st.session_state.pop(
+            "remote_field_review_notice",
+            None,
+        )
+        if review_notice:
+            st.success(review_notice)
+        review_context = st.session_state.get("remote_field_review")
+        is_reviewing = (
+            isinstance(review_context, dict)
+            and review_context.get("connection_key") == connection_key
+            and review_context.get("database") == selected_remote_database
+        )
         st.caption(
-            "平台会为该数据库创建本机只读分析副本（最大 100 MB）。"
+            "平台会先检查字段是否存在以及字段名是否可理解。"
+            "清晰字段不要求额外注释；检查通过后才创建本机只读分析副本。"
         )
         add_database = st.button(
-            "添加数据库",
+            "重新检查并添加" if is_reviewing else "检查并添加",
             key=f"add_{provider_key}_database",
             use_container_width=True,
         )
@@ -742,8 +875,8 @@ def _render_remote_database_import(
                     current_user.id,
                     current_user.session_version,
                 )
-                with st.spinner("正在同步数据库结构和数据…"):
-                    staged_snapshot = stage_remote_database(
+                with st.spinner("正在检查数据库字段…"):
+                    initial_preflight = preflight_remote_database(
                         database_type,
                         remote_host,
                         remote_port_number,
@@ -751,19 +884,68 @@ def _render_remote_database_import(
                         remote_password,
                         selected_remote_database,
                     )
-                registered = service.publish_staged_datasource(
+                descriptions = service.pending_field_descriptions(
                     current_user.id,
-                    current_user.session_version,
-                    staged_path=staged_snapshot.staged_path,
-                    target_path=staged_snapshot.target_path,
-                    display_name=selected_remote_database,
+                    initial_preflight.source_key,
                 )
-                st.session_state.active_datasource_id = registered.id
-                _clear_query_state()
-                st.session_state.pop("remote_database_catalog", None)
-                st.session_state.pop(f"{provider_key}_password", None)
-                st.session_state.database_notice = "数据库已添加"
-                st.rerun()
+                preflight = initial_preflight
+                if descriptions:
+                    with st.spinner("正在应用已补充的字段说明…"):
+                        preflight = preflight_remote_database(
+                            database_type,
+                            remote_host,
+                            remote_port_number,
+                            remote_user,
+                            remote_password,
+                            selected_remote_database,
+                            field_descriptions=descriptions,
+                        )
+
+                if preflight.report.needs_review:
+                    service.upsert_pending_datasource_review(
+                        current_user.id,
+                        current_user.session_version,
+                        source_key=preflight.source_key,
+                        display_name=selected_remote_database,
+                        provider=preflight.provider,
+                        validation_report=preflight.report.to_dict(),
+                    )
+                    st.session_state.remote_field_review = {
+                        "connection_key": connection_key,
+                        "database": selected_remote_database,
+                        "source_key": preflight.source_key,
+                        "report": preflight.report,
+                    }
+                else:
+                    with st.spinner("正在同步数据库结构和数据…"):
+                        staged_snapshot = stage_remote_database(
+                            database_type,
+                            remote_host,
+                            remote_port_number,
+                            remote_user,
+                            remote_password,
+                            selected_remote_database,
+                            field_descriptions=descriptions,
+                        )
+                    registered = service.publish_staged_datasource(
+                        current_user.id,
+                        current_user.session_version,
+                        staged_path=staged_snapshot.staged_path,
+                        target_path=staged_snapshot.target_path,
+                        display_name=selected_remote_database,
+                    )
+                    service.finish_pending_datasource_review(
+                        current_user.id,
+                        current_user.session_version,
+                        source_key=preflight.source_key,
+                    )
+                    st.session_state.active_datasource_id = registered.id
+                    _clear_query_state()
+                    st.session_state.pop("remote_database_catalog", None)
+                    st.session_state.pop("remote_field_review", None)
+                    st.session_state.pop(f"{provider_key}_password", None)
+                    st.session_state.database_notice = "数据库已添加"
+                    st.rerun()
             except (AuthError, DataSourceError) as error:
                 service.record_audit(
                     actor_user_id=current_user.id,
@@ -777,6 +959,25 @@ def _render_remote_database_import(
             finally:
                 if staged_snapshot is not None:
                     staged_snapshot.staged_path.unlink(missing_ok=True)
+
+        review_context = st.session_state.get("remote_field_review")
+        if (
+            isinstance(review_context, dict)
+            and review_context.get("connection_key") == connection_key
+            and review_context.get("database") == selected_remote_database
+            and isinstance(
+                review_context.get("report"),
+                FieldReadinessReport,
+            )
+        ):
+            _render_field_readiness_report(review_context["report"])
+            _render_pending_field_editor(
+                current_user,
+                service,
+                source_key=str(review_context["source_key"]),
+                report=review_context["report"],
+            )
+
 
 def _render_excel_import(
     current_user: User,
