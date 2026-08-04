@@ -1892,6 +1892,43 @@ def snapshot_sync_status(database_path: Path | str) -> dict[str, Any]:
     }
 
 
+def snapshot_remote_connection_info(
+    database_path: Path | str,
+) -> dict[str, str | int]:
+    """Return the non-secret connection fields stored with a snapshot."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        raise DataSourceError("远程数据库快照不存在。")
+
+    metadata = _snapshot_metadata(path)
+    provider = metadata.get("database_type", "")
+    if (
+        provider not in REMOTE_DATABASE_TYPES
+        or metadata.get("sync_enabled") != "1"
+    ):
+        raise DataSourceError(
+            "该数据源没有可用的远程重连信息，请重新添加。"
+        )
+
+    host = metadata.get("source_host", "").strip()
+    user = metadata.get("source_user", "").strip()
+    database = metadata.get("database_name", "").strip()
+    try:
+        port = int(metadata.get("source_port", "0"))
+    except ValueError as error:
+        raise DataSourceError("远程数据源端口信息已损坏。") from error
+    if not host or not user or not database or not 1 <= port <= 65535:
+        raise DataSourceError("远程数据源重连信息不完整。")
+
+    return {
+        "database_type": provider,
+        "host": host,
+        "port": port,
+        "user": user,
+        "database": database,
+    }
+
+
 def stage_remote_database(
     database_type: str,
     host: str,
@@ -2193,6 +2230,43 @@ def _verify_sync_credentials(
     )
     if expected != supplied:
         raise DataSourceError("当前会话的远程数据库凭据与快照不匹配。")
+
+
+def reconnect_remote_database_snapshot(
+    database_path: Path | str,
+    password: str,
+) -> RemoteDatabaseCredentials:
+    """Validate a password and restore session-only snapshot credentials."""
+    path = Path(database_path).expanduser().resolve()
+    upload_directory = ensure_private_upload_directory()
+    if path.parent != upload_directory or not path.is_file():
+        raise DataSourceError("待重连的数据库快照无效。")
+
+    info = snapshot_remote_connection_info(path)
+    credentials = create_remote_database_credentials(
+        str(info["database_type"]),
+        str(info["host"]),
+        int(info["port"]),
+        str(info["user"]),
+        str(password or ""),
+        str(info["database"]),
+    )
+    _verify_sync_credentials(_snapshot_metadata(path), credentials)
+
+    remote = None
+    try:
+        remote = _connect_remote_snapshot(credentials)
+    except DataSourceError:
+        raise
+    except Exception as error:
+        raise DataSourceError(
+            f"{credentials.database_type} 数据库重连失败："
+            f"{_safe_driver_error(error, credentials.password)}"
+        ) from error
+    finally:
+        if remote is not None:
+            remote.close()
+    return credentials
 
 
 def sync_remote_database_snapshot(

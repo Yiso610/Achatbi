@@ -722,12 +722,16 @@
         ? `每 ${refreshSeconds / 60} 分钟自动刷新`
         : `每 ${refreshSeconds} 秒自动刷新`;
       const statusClass = currentPayload.sync_status === "warning" ? " warning" : "";
+      const reconnectButton = currentPayload.reconnect_available && !editMode
+        ? '<button class="tool-button" data-action="reconnect">重新连接</button>'
+        : '';
       topbar.innerHTML = `
         <div class="title-wrap">
           <h1 class="title">${escapeHtml(currentPayload.title || "可视化数据大屏")}</h1>
           <div class="status"><span class="status-dot${statusClass}"></span><span>${escapeHtml(statusText)}</span><span class="secondary">· ${escapeHtml(refreshLabel)}</span></div>
         </div>
         <div class="toolbar">
+          ${reconnectButton}
           ${editMode ? `<span class="editing-note">${currentPayload.dirty ? "有未保存修改" : "正在编辑"}</span><button class="tool-button" data-action="cancel">退出编辑</button><button class="tool-button" data-action="undo" title="撤回上一步布局操作"${currentPayload.can_undo ? "" : " disabled"}>撤回</button><button class="tool-button primary" data-action="save">保存</button>` : '<button class="tool-button" data-action="fullscreen">全屏</button><button class="tool-button primary" data-action="edit">编辑</button>'}
         </div>
       `;
@@ -739,6 +743,7 @@
       topbar.querySelector('[data-action="save"]')?.addEventListener("click", () => emit("save"));
       topbar.querySelector('[data-action="cancel"]')?.addEventListener("click", () => emit("cancel"));
       topbar.querySelector('[data-action="undo"]')?.addEventListener("click", () => emit("undo"));
+      topbar.querySelector('[data-action="reconnect"]')?.addEventListener("click", () => emit("reconnect"));
       topbar.querySelector('[data-action="fullscreen"]')?.addEventListener("click", async () => {
         if (!document.fullscreenElement) await app.requestFullscreen?.();
         else await document.exitFullscreen?.();

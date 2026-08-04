@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
@@ -14,6 +15,7 @@ from auth.constants import ROLE_DATA_MANAGER, ROLE_VIEWER
 from auth.database import MetaDatabase
 from auth.passwords import PasswordService
 from auth.service import AuthService, get_auth_service
+from auth import ui as auth_ui
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -176,6 +178,24 @@ class AuthUiTestCase(unittest.TestCase):
             "连接并读取数据库",
             {button.label for button in manager_app.button},
         )
+
+    def test_logout_clears_reconnect_password_and_credentials(self) -> None:
+        session_state = {
+            "auth_user_id": self.admin.id,
+            "remote_sync_credentials": {4: object()},
+            "dashboard_reconnect_password_1_4": "secret",
+            "unrelated": "keep",
+        }
+
+        with patch.object(auth_ui.st, "session_state", session_state):
+            auth_ui.clear_user_session()
+
+        self.assertNotIn("remote_sync_credentials", session_state)
+        self.assertNotIn(
+            "dashboard_reconnect_password_1_4",
+            session_state,
+        )
+        self.assertEqual(session_state["unrelated"], "keep")
 
 
 

@@ -58,6 +58,7 @@ BUSINESS_SESSION_KEYS = {
     "auth_sensitive_keys_to_clear",
 }
 BUSINESS_SESSION_PREFIXES = (
+    "dashboard_reconnect_password_",
     "edit_name_",
     "edit_email_",
     "edit_role_",
@@ -80,6 +81,7 @@ AUDIT_ACTION_LABELS = {
     "import_datasource": "导入数据源",
     "import_datasource_cleanup": "清理旧数据源版本",
     "sync_datasource": "同步数据源",
+    "reconnect_datasource": "重新连接数据源",
     "delete_datasource": "删除数据源",
     "delete_datasource_cleanup": "清理已删除数据源",
     "query_data": "查询数据",

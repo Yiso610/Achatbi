@@ -29,6 +29,8 @@ from dashboard_component import dashboard_canvas
 from infrastructure.data_sources import (
     DataSourceError,
     RemoteDatabaseCredentials,
+    reconnect_remote_database_snapshot,
+    snapshot_remote_connection_info,
     snapshot_sync_status,
     sync_remote_database_snapshot,
 )
@@ -92,6 +94,10 @@ def _history_key(user_id: int) -> str:
     return f"dashboard_undo_history_{user_id}"
 
 
+def _reconnect_key(user_id: int) -> str:
+    return f"dashboard_reconnect_{user_id}"
+
+
 def _push_undo_snapshot(user_id: int, layout: dict[str, Any]) -> None:
     history = st.session_state.get(_history_key(user_id))
     if not isinstance(history, list):
@@ -114,7 +120,7 @@ def _query_payload(
     auth_service: AuthService,
     current_user: User,
     layout: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, str]]:
+) -> tuple[dict[str, dict[str, Any]], list[str], dict[str, Any]]:
     def json_safe_rows(
         rows: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
@@ -152,6 +158,7 @@ def _query_payload(
     source_sync_statuses: dict[int, dict[str, Any]] = {}
     sync_warnings: list[str] = []
     sync_successes: list[str] = []
+    reconnect_sources: list[dict[str, Any]] = []
     raw_credentials = st.session_state.get(
         "remote_sync_credentials",
         {},
@@ -210,6 +217,12 @@ def _query_payload(
                     sync_warnings.append(
                         f"“{datasource.display_name}”缺少当前会话凭据，"
                         "正在显示最近成功快照。"
+                    )
+                    reconnect_sources.append(
+                        {
+                            "id": datasource.id,
+                            "name": datasource.display_name,
+                        }
                     )
                 else:
                     sync_warnings.append(
@@ -295,8 +308,113 @@ def _query_payload(
                 else ""
             )
         ),
+        "reconnect_sources": reconnect_sources,
     }
     return payload, refresh_times, sync_summary
+
+
+@st.dialog("快速重新连接", width="small")
+def _render_remote_reconnect_dialog(
+    auth_service: AuthService,
+    current_user: User,
+    reconnect_sources: list[dict[str, Any]],
+) -> None:
+    if not reconnect_sources:
+        st.info("当前没有需要重新连接的远程数据源。")
+        return
+
+    source_by_label = {
+        f"{source['name']} · #{source['id']}": int(source["id"])
+        for source in reconnect_sources
+    }
+    if len(source_by_label) == 1:
+        source_label = next(iter(source_by_label))
+        st.markdown(f"**数据源：** {source_label.rsplit(' · #', 1)[0]}")
+    else:
+        source_label = st.selectbox(
+            "选择数据源",
+            list(source_by_label),
+            key=f"dashboard_reconnect_source_{current_user.id}",
+        )
+    datasource_id = source_by_label[source_label]
+
+    try:
+        datasource = auth_service.resolve_authorized_datasource(
+            current_user.id,
+            datasource_id,
+            QUERY_DATA,
+        )
+        info = snapshot_remote_connection_info(datasource.path)
+    except (AuthError, DataSourceError, OSError) as error:
+        st.error(str(error))
+        return
+
+    st.caption(
+        f"{info['database_type']} · {info['user']}@{info['host']}:"
+        f"{info['port']}/{info['database']}"
+    )
+    with st.form(
+        f"dashboard_reconnect_form_{current_user.id}_{datasource_id}"
+    ):
+        password = st.text_input(
+            "数据库密码",
+            type="password",
+            key=f"dashboard_reconnect_password_{current_user.id}_{datasource_id}",
+            help="密码只保存在当前会话内存中，不会写入快照。",
+        )
+        submitted = st.form_submit_button(
+            "重新连接并恢复刷新",
+            type="primary",
+            use_container_width=True,
+        )
+    if not submitted:
+        return
+
+    try:
+        with st.spinner("正在验证数据库连接…"):
+            credentials = reconnect_remote_database_snapshot(
+                datasource.path,
+                password,
+            )
+        raw_credentials = st.session_state.get(
+            "remote_sync_credentials",
+            {},
+        )
+        credentials_by_id = (
+            dict(raw_credentials)
+            if isinstance(raw_credentials, dict)
+            else {}
+        )
+        credentials_by_id[datasource.id] = credentials
+        st.session_state.remote_sync_credentials = credentials_by_id
+        try:
+            auth_service.record_audit(
+                actor_user_id=current_user.id,
+                action="reconnect_datasource",
+                outcome="success",
+                target_type="datasource",
+                target_id=datasource.id,
+                datasource_id=datasource.id,
+                details={"database_type": credentials.database_type},
+            )
+        except AuthError:
+            pass
+        _notice("数据源已重新连接，五分钟刷新已恢复。")
+        st.rerun()
+    except (DataSourceError, OSError) as error:
+        try:
+            auth_service.record_audit(
+                actor_user_id=current_user.id,
+                action="reconnect_datasource",
+                outcome="failure",
+                target_type="datasource",
+                target_id=datasource.id,
+                datasource_id=datasource.id,
+                details={"error_type": error.__class__.__name__},
+            )
+        except AuthError:
+            pass
+        st.error(str(error))
 
 
 @st.dialog("选择保存的查询图表", width="large")
@@ -440,6 +558,8 @@ def _apply_canvas_event(
                 st.session_state[dirty_key] = previous != persisted_layout
         elif action == "refresh":
             pass
+        elif action == "reconnect":
+            st.session_state[_reconnect_key(current_user.id)] = True
         elif action == "add":
             st.session_state[_picker_key(current_user.id)] = str(
                 event["slot_id"]
@@ -524,6 +644,9 @@ def _render_dashboard_fragment(
         "refresh_seconds": REFRESH_SECONDS,
         "sync_status": sync_summary["status"],
         "sync_message": sync_summary["message"],
+        "reconnect_available": bool(
+            sync_summary["reconnect_sources"]
+        ),
         "dirty": bool(
             st.session_state.get(_dirty_key(current_user.id), False)
         ),
@@ -536,6 +659,12 @@ def _render_dashboard_fragment(
         edit_mode=edit_mode,
         key=f"dashboard_canvas_{current_user.id}",
     )
+    if st.session_state.pop(_reconnect_key(current_user.id), False):
+        _render_remote_reconnect_dialog(
+            auth_service,
+            current_user,
+            sync_summary["reconnect_sources"],
+        )
     _apply_canvas_event(
         event,
         service,

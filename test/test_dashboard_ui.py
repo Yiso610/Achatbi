@@ -77,6 +77,32 @@ class DashboardUiTestCase(unittest.TestCase):
             layout,
         )
 
+    def test_reconnect_event_requests_password_dialog(self) -> None:
+        user = SimpleNamespace(id=38, session_version=1)
+        layout = default_dashboard_layout()
+        session_state = {}
+        event = json.dumps(
+            {
+                "action": "reconnect",
+                "event_id": "reconnect-click",
+            }
+        )
+
+        with (
+            patch.object(dashboard_ui.st, "session_state", session_state),
+            patch.object(dashboard_ui.st, "rerun"),
+        ):
+            dashboard_ui._apply_canvas_event(
+                event,
+                Mock(),
+                user,
+                layout,
+            )
+
+        self.assertTrue(
+            session_state[dashboard_ui._reconnect_key(user.id)]
+        )
+
     def test_dashboard_syncs_each_remote_source_before_querying(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "snapshot.db"
@@ -166,6 +192,68 @@ class DashboardUiTestCase(unittest.TestCase):
         self.assertEqual(refresh_times, ["10:05:01"])
         self.assertEqual(summary["status"], "ok")
         self.assertIn("10:05:00", summary["message"])
+
+    def test_missing_credentials_offers_quick_reconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "snapshot.db"
+            database_path.write_bytes(b"snapshot")
+            user = SimpleNamespace(id=40, session_version=1)
+            query = SimpleNamespace(
+                id=8,
+                datasource_id=5,
+                title="销售趋势",
+                datasource_name="销售库",
+                sql_query="SELECT 1 AS value",
+                visualization_spec={"chart_type": "none"},
+            )
+            source = SimpleNamespace(
+                id=5,
+                version=1,
+                display_name="销售库",
+                path=database_path,
+            )
+            service = Mock()
+            service.queries_by_id.return_value = {8: query}
+            auth_service = Mock()
+            auth_service.resolve_authorized_datasource.return_value = source
+
+            with (
+                patch.object(dashboard_ui.st, "session_state", {}),
+                patch.object(
+                    dashboard_ui,
+                    "snapshot_sync_status",
+                    side_effect=[
+                        {
+                            "remote": True,
+                            "enabled": True,
+                            "data_version": 1,
+                        },
+                        {
+                            "remote": True,
+                            "enabled": True,
+                            "data_version": 1,
+                        },
+                    ],
+                ),
+                patch.object(
+                    dashboard_ui,
+                    "_execute_dashboard_query",
+                    return_value=([{"value": 1}], None, "10:05:01"),
+                ),
+            ):
+                _, _, summary = dashboard_ui._query_payload(
+                    service,
+                    auth_service,
+                    user,
+                    {"id": "slot", "kind": "slot", "widget_id": 8},
+                )
+
+        self.assertEqual(summary["status"], "warning")
+        self.assertEqual(
+            summary["reconnect_sources"],
+            [{"id": 5, "name": "销售库"}],
+        )
+        self.assertIn("缺少当前会话凭据", summary["message"])
 
 
 if __name__ == "__main__":

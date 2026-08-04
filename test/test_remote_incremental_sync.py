@@ -166,6 +166,78 @@ class RemoteIncrementalSyncTestCase(unittest.TestCase):
             ("full", "", ""),
         )
 
+    def test_reconnect_validates_password_and_returns_session_credentials(
+        self,
+    ) -> None:
+        remote = Mock()
+        with (
+            patch.object(
+                data_sources,
+                "_remote_host_is_allowed",
+                return_value=True,
+            ),
+            patch.object(
+                data_sources,
+                "_resolve_remote_host",
+                side_effect=lambda host, port: host,
+            ),
+            patch.object(
+                data_sources,
+                "_connect_remote_snapshot",
+                return_value=remote,
+            ) as connect,
+        ):
+            credentials = (
+                data_sources.reconnect_remote_database_snapshot(
+                    self.snapshot_path,
+                    "new-secret",
+                )
+            )
+
+        self.assertEqual(credentials.database_type, "MySQL")
+        self.assertEqual(credentials.host, "10.0.0.8")
+        self.assertEqual(credentials.port, 3306)
+        self.assertEqual(credentials.user, "reader")
+        self.assertEqual(credentials.database, "sales")
+        self.assertEqual(credentials.password, "new-secret")
+        connect.assert_called_once_with(credentials)
+        remote.close.assert_called_once_with()
+        with sqlite3.connect(self.snapshot_path) as local:
+            metadata_values = [
+                str(row[0])
+                for row in local.execute(
+                    "SELECT value FROM _chatbi_source_metadata"
+                ).fetchall()
+            ]
+        self.assertNotIn("new-secret", metadata_values)
+
+    def test_reconnect_masks_password_in_connection_error(self) -> None:
+        with (
+            patch.object(
+                data_sources,
+                "_remote_host_is_allowed",
+                return_value=True,
+            ),
+            patch.object(
+                data_sources,
+                "_resolve_remote_host",
+                side_effect=lambda host, port: host,
+            ),
+            patch.object(
+                data_sources,
+                "_connect_remote_snapshot",
+                side_effect=RuntimeError("access denied for new-secret"),
+            ),
+        ):
+            with self.assertRaises(data_sources.DataSourceError) as context:
+                data_sources.reconnect_remote_database_snapshot(
+                    self.snapshot_path,
+                    "new-secret",
+                )
+
+        self.assertNotIn("new-secret", str(context.exception))
+        self.assertIn("******", str(context.exception))
+
     def test_due_sync_upserts_rows_and_advances_version(self) -> None:
         remote = _FakeRemoteConnection(
             [
